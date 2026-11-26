@@ -55,6 +55,8 @@ export async function appendChiefAlertCard(
     triggerId: feed.triggerId,
     triggerName: feed.triggerName,
     workerAgentId: feed.agentId,
+    routedAgentId: feed.routedAgentId,
+    routedAgentTitle: feed.routedAgentTitle,
     createdAt: feed.createdAt,
   };
   try {

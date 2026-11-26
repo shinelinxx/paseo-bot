@@ -95,6 +95,7 @@
   "copyWebhook": "Copy Link",
   "copiedToast": "Copied to clipboard",
   "openAgent": "View Chat",
+  "routedSessionBtn": "Routed: {{title}}",
   "missionStats": "Skipped {{silent}} unchanged · Notified {{notify}}",
   "missionNoiseCount": "{{count}} filter(s)",
   "missionApprovedCount": "Confirmed {{count}}x",

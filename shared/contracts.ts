@@ -49,6 +49,7 @@ export const FeedActionSchema = z.object({
   kind: FeedActionKindSchema,
   prompt: z.string().optional(),
   cwd: z.string().optional(),
+  targetAgentId: z.string().optional(),
   delayMinutes: z.number().min(1).max(60 * 24 * 14).optional(),
   executedAt: z.string().optional(),
 });
@@ -122,6 +123,8 @@ export const FeedItemSchema = z.object({
   triggerName: z.string().optional(),
   agentId: z.string().optional(),
   workspaceId: z.string().optional(),
+  routedAgentId: z.string().optional(),
+  routedAgentTitle: z.string().optional(),
   unread: z.boolean().default(true),
 });
 export type FeedItem = z.output<typeof FeedItemSchema>;
@@ -239,6 +242,8 @@ export const botAlertTimelineSchema = z.object({
   triggerId: z.string().optional(),
   triggerName: z.string().optional(),
   workerAgentId: z.string().optional(),
+  routedAgentId: z.string().optional(),
+  routedAgentTitle: z.string().optional(),
   createdAt: z.string(),
 });
 export type BotAlertTimelineData = z.output<typeof botAlertTimelineSchema>;

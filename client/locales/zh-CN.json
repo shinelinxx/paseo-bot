@@ -95,6 +95,7 @@
   "copyWebhook": "复制链接",
   "copiedToast": "已复制到剪贴板",
   "openAgent": "查看对话",
+  "routedSessionBtn": "已续接：{{title}}",
   "missionStats": "无变化跳过 {{silent}} 次 · 已提醒 {{notify}} 次",
   "missionNoiseCount": "{{count}} 条过滤条件",
   "missionApprovedCount": "已确认 {{count}} 次",

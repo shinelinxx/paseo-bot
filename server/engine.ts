@@ -39,7 +39,9 @@ import {
   computeRoutineSuggestions,
   draftMissionFromIntent,
   extractSuggestedActionsFromMarkdown,
+  routeFollowUpCandidate,
   splitReplyIntoPreviewAndDetails,
+  type RoutableAgentCandidate,
 } from "./intent";
 import {
   appendChiefAlertCard,
@@ -1280,6 +1282,53 @@ export class ProactiveEngine {
     return { ok: true, updatedTriggerName };
   }
 
+  private async listRoutableAgentCandidates(): Promise<RoutableAgentCandidate[]> {
+    if (!this.paseo) return [];
+    const [agentRes, wsRes] = await Promise.all([
+      this.paseo.agents.list().catch(() => null),
+      this.paseo.workspaces.list().catch(() => null),
+    ]);
+    if (!agentRes) return [];
+
+    const wsMap = new Map<string, { title: string; projectName: string }>();
+    for (const ws of wsRes?.entries ?? []) {
+      const wsTitle = (ws.title && ws.title.trim()) || ws.name || "";
+      const projectName =
+        (ws.projectCustomName && ws.projectCustomName.trim()) ||
+        ws.projectDisplayName ||
+        "";
+      wsMap.set(ws.id, { title: wsTitle, projectName });
+    }
+
+    const results: RoutableAgentCandidate[] = [];
+    for (const entry of agentRes.entries) {
+      const a = entry.agent as unknown as Record<string, unknown>;
+      if (!a || typeof a.id !== "string" || a.archivedAt) continue;
+      const isBg = Boolean(a.background);
+      const labels =
+        a.labels && typeof a.labels === "object"
+          ? (a.labels as Record<string, unknown>)
+          : undefined;
+      if (isBg || labels?.["paseo-bot/role"] === "scout") continue;
+
+      const wsId = typeof a.workspaceId === "string" ? a.workspaceId : undefined;
+      const wsMeta = wsId ? wsMap.get(wsId) : undefined;
+      const rawUpdated = typeof a.updatedAt === "string" ? Date.parse(a.updatedAt) : 0;
+
+      results.push({
+        id: a.id,
+        title: typeof a.title === "string" ? a.title : "",
+        cwd: typeof a.cwd === "string" ? a.cwd : "",
+        workspaceId: wsId,
+        workspaceTitle: wsMeta?.title,
+        projectName: wsMeta?.projectName,
+        updatedAtMs: Number.isFinite(rawUpdated) ? rawUpdated : 0,
+        isBackground: isBg,
+      });
+    }
+    return results;
+  }
+
   async executeFeedAction(input: {
     feedId: string;
     actionId?: string;
@@ -1350,7 +1399,10 @@ export class ProactiveEngine {
       `请继续跟进这项内容：「${feedItem.title}」`;
 
     let launchedAgentId: string | undefined;
-    let continuedExistingSession = false;
+    let continuedSameOriginSession = false;
+    let routedExternalTarget:
+      | { agentId: string; title: string; cwd: string; workspaceId?: string }
+      | undefined;
 
     if (kind === "delegate") {
       const worker = await this.delegateTask({
@@ -1361,14 +1413,46 @@ export class ProactiveEngine {
         notifyChiefOnFinish: true,
       });
       launchedAgentId = worker.agentId;
-    } else if (this.paseo && feedItem.agentId) {
-      // Directly continue in the original agent session to preserve 100% context!
-      const handle = this.paseo.agents.ref(feedItem.agentId);
-      const refreshed = await handle.refresh().catch(() => null);
-      if (refreshed && !refreshed.agent.archivedAt) {
-        await handle.send(promptText);
-        launchedAgentId = feedItem.agentId;
-        continuedExistingSession = true;
+    } else if (this.paseo) {
+      const candidates = await this.listRoutableAgentCandidates();
+      const route = routeFollowUpCandidate({
+        followUpPrompt: promptText,
+        cardMarkdown: fullReference,
+        fallbackAgentId: feedItem.agentId,
+        explicitTargetAgentHint: matchedAction?.targetAgentId,
+        candidates,
+      });
+
+      const targetId = route?.agentId || feedItem.agentId;
+      if (targetId) {
+        const handle = this.paseo.agents.ref(targetId);
+        const refreshed = await handle.refresh().catch(() => null);
+        if (refreshed && !refreshed.agent.archivedAt) {
+          const routedAway = Boolean(
+            route?.routedAwayFromOrigin ||
+              (feedItem.agentId && targetId !== feedItem.agentId) ||
+              (!feedItem.agentId && route),
+          );
+          const payload = routedAway
+            ? `[来自 Paseo Bot 汇总卡片的跟进指令]\n${promptText}`
+            : promptText;
+          await handle.send(payload);
+          launchedAgentId = targetId;
+          if (routedAway) {
+            routedExternalTarget = {
+              agentId: targetId,
+              title:
+                route?.title ||
+                (typeof (refreshed.agent as { title?: unknown }).title === "string"
+                  ? ((refreshed.agent as { title: string }).title || targetId.slice(0, 8))
+                  : targetId.slice(0, 8)),
+              cwd: route?.cwd || refreshed.agent.cwd || targetCwd,
+              workspaceId: route?.workspaceId ?? refreshed.agent.workspaceId,
+            };
+          } else {
+            continuedSameOriginSession = true;
+          }
+        }
       }
     }
 
@@ -1393,10 +1477,56 @@ export class ProactiveEngine {
         const act = found.actions.find((a) => a.id === matchedAction.id);
         if (act) act.executedAt = nowIso;
       }
-      if (continuedExistingSession && launchedAgentId) {
+
+      if (routedExternalTarget) {
+        // Preserve the multi-session summary card intact while tracking the routed session separately!
+        const cleanRoutedTitle = cleanTaskTitle(routedExternalTarget.title).slice(0, 28);
+        found.routedAgentId = routedExternalTarget.agentId;
+        found.routedAgentTitle = cleanRoutedTitle;
+
+        const existingTargetCardIdx = draft.feed.findIndex(
+          (f) => f.id !== found.id && f.agentId === routedExternalTarget!.agentId && f.inProgress,
+        );
+        if (existingTargetCardIdx === -1) {
+          draft.feed.unshift({
+            id: createShortId("feed"),
+            createdAt: nowIso,
+            level: "worker_update",
+            title: `正在续接：${cleanRoutedTitle}`,
+            summary: promptText,
+            actions: [],
+            inProgress: true,
+            agentId: routedExternalTarget.agentId,
+            workspaceId: routedExternalTarget.workspaceId,
+            unread: false,
+          });
+        }
+
+        const existingWorker = draft.workers.find(
+          (w) => w.agentId === routedExternalTarget!.agentId,
+        );
+        if (existingWorker) {
+          existingWorker.status = "running";
+          existingWorker.updatedAt = nowIso;
+        } else {
+          draft.workers.unshift({
+            id: createShortId("wish"),
+            agentId: routedExternalTarget.agentId,
+            workspaceId: routedExternalTarget.workspaceId,
+            title: cleanRoutedTitle || "续接会话",
+            cwd: routedExternalTarget.cwd,
+            provider: this.settings.chiefProvider,
+            isolation: "local",
+            status: "running",
+            goal: promptText.slice(0, 1000),
+            notifyChiefOnFinish: false,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+        }
+      } else if (continuedSameOriginSession && launchedAgentId) {
         found.inProgress = true;
         found.createdAt = nowIso;
-        // Move card to top so user sees live progress in place
         draft.feed.splice(idx, 1);
         draft.feed.unshift(found);
 
@@ -1429,9 +1559,11 @@ export class ProactiveEngine {
     await this.broadcastSnapshot();
     return {
       ok: true,
-      message: continuedExistingSession
-        ? "已在原会话继续跟进，完成后将自动更新卡片"
-        : `已开始跟进：${matchedAction?.label || "继续处理"}`,
+      message: routedExternalTarget
+        ? `已路由至会话「${cleanTaskTitle(routedExternalTarget.title).slice(0, 22)}」继续处理`
+        : continuedSameOriginSession
+          ? "已在原会话继续跟进，完成后将自动更新卡片"
+          : `已开始跟进：${matchedAction?.label || "继续处理"}`,
       agentId: launchedAgentId,
     };
   }

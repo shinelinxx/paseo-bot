@@ -12,7 +12,9 @@ import {
   extractDailyTime,
   extractIntervalSec,
   extractSuggestedActionsFromMarkdown,
+  routeFollowUpCandidate,
   splitReplyIntoPreviewAndDetails,
+  type RoutableAgentCandidate,
 } from "../server/intent.ts";
 import {
   BotStateStore,
@@ -285,4 +287,81 @@ test("cleanTaskTitle strips redundant nested prefixes and extractSuggestedAction
   assert.equal(actions.length, 2);
   assert.match(actions[0].label, /核对今日 4 笔限购订单记录/);
   assert.match(actions[1].prompt ?? "", /voice-clean/);
+});
+
+test("routeFollowUpCandidate routes multi-session summary follow-ups to the matching source session", () => {
+  const candidates: RoutableAgentCandidate[] = [
+    {
+      id: "211b31ae-b40f-4833-a2d4-256cbf2953ab",
+      title: "检查当前所有工作区进度",
+      cwd: "/tmp/KnowledgeBase",
+      workspaceId: "wks_kb",
+      workspaceTitle: "KnowledgeBase",
+      updatedAtMs: 1000,
+    },
+    {
+      id: "529a6b80-1111-2222-3333-444444444444",
+      title: "启动账号日常任务",
+      cwd: "/tmp/DemoWarmup",
+      workspaceId: "wks_warmup",
+      workspaceTitle: "启动测试账号日常流程",
+      updatedAtMs: 2000,
+    },
+    {
+      id: "787df7e4-aaaa-bbbb-cccc-dddddddddddd",
+      title: "修复插件麦克风延迟",
+      cwd: "/tmp/plugins/voice-clean",
+      workspaceId: "wks_voice",
+      workspaceTitle: "排查软件语音转文字失败问题",
+      updatedAtMs: 3000,
+    },
+  ];
+
+  const multiSessionCard = [
+    "已排查全部工作区，目前待确认事项如下：",
+    "",
+    "1. **完成测试账号登录流程**",
+    "   - 来源：工作区「启动测试账号日常流程」➔ 子会话 `529a6b8`",
+    "",
+    "2. **确认是否给 `voice-clean` 增加实时语音自动切快模型功能**",
+    "   - 来源：工作区「排查软件语音转文字失败问题」（会话 `787df7e`）",
+  ].join("\n");
+
+  // 1. Follow-up about voice-clean routes to 787df7e4-... (and extracted action also carries targetAgentId)
+  const actions = extractSuggestedActionsFromMarkdown(multiSessionCard);
+  const voiceAction = actions.find((a) => a.prompt?.includes("voice-clean"));
+  assert.equal(voiceAction?.targetAgentId, "787df7e");
+
+  const routeVoice = routeFollowUpCandidate({
+    followUpPrompt: "确认给 voice-clean 增加实时语音自动切快模型功能",
+    cardMarkdown: multiSessionCard,
+    fallbackAgentId: "211b31ae-b40f-4833-a2d4-256cbf2953ab",
+    candidates,
+  });
+  assert.equal(routeVoice?.agentId, "787df7e4-aaaa-bbbb-cccc-dddddddddddd");
+  assert.equal(routeVoice?.routedAwayFromOrigin, true);
+
+  // 2. Follow-up even without hex ID in card still routes via workspace title & project slug
+  const cardWithoutIds = [
+    "1. **检查测试账号登录状态** — 来源：工作区「启动测试账号日常流程」",
+    "2. **给语音插件加上快模型切换** — 来源：工作区「排查软件语音转文字失败问题」",
+  ].join("\n");
+  const routeByWorkspace = routeFollowUpCandidate({
+    followUpPrompt: "语音转文字那个插件直接按方案改吧",
+    cardMarkdown: cardWithoutIds,
+    fallbackAgentId: "211b31ae-b40f-4833-a2d4-256cbf2953ab",
+    candidates,
+  });
+  assert.equal(routeByWorkspace?.agentId, "787df7e4-aaaa-bbbb-cccc-dddddddddddd");
+  assert.equal(routeByWorkspace?.routedAwayFromOrigin, true);
+
+  // 3. Generic meta follow-up about the summary itself stays safely on fallbackAgentId
+  const routeGeneric = routeFollowUpCandidate({
+    followUpPrompt: "把上面这几条按优先级重新排个表格",
+    cardMarkdown: multiSessionCard,
+    fallbackAgentId: "211b31ae-b40f-4833-a2d4-256cbf2953ab",
+    candidates,
+  });
+  assert.equal(routeGeneric?.agentId, "211b31ae-b40f-4833-a2d4-256cbf2953ab");
+  assert.equal(routeGeneric?.routedAwayFromOrigin, false);
 });

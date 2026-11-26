@@ -1195,6 +1195,27 @@ const FeedItemCard = memo(function FeedItemCard({
             </Text>
           </Pressable>
 
+          {item.routedAgentId && item.routedAgentId !== item.agentId ? (
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => onOpenAgent(item.routedAgentId!)}
+              style={[
+                styles.microActionBtn,
+                {
+                  borderColor: theme.colors.accent,
+                  backgroundColor: theme.colors.surface2,
+                },
+              ]}
+            >
+              <Icon name="ArrowUpRight" size={12} color={theme.colors.accent} />
+              <Text style={[styles.text12Semi, { color: theme.colors.accent }]}>
+                {t("routedSessionBtn", {
+                  title: item.routedAgentTitle || item.routedAgentId.slice(0, 8),
+                })}
+              </Text>
+            </Pressable>
+          ) : null}
+
           {item.agentId ? (
             <Pressable
               accessibilityRole="button"

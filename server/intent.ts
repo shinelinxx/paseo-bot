@@ -501,20 +501,31 @@ export function extractSuggestedActionsFromMarkdown(markdown: string): FeedActio
   const actions: FeedAction[] = [];
   const seenLabels = new Set<string>();
 
-  // Match numbered bold items like: 1. **确认是否给 voice-clean 增加...** or - **归档 00-Inbox 草稿**
-  const itemRegex = /(?:^|\n)\s*(?:\d+\.|[-*])\s+\*\*([^*]{4,64})\*\*/g;
+  // Split by numbered bold items or bullet bold items so we can also inspect each item's body lines for session/path hints
+  const itemHeaderRegex = /(?:^|\n)[ \t]*(?:\d+\.|[-*])[ \t]+\*\*([^*]{4,72})\*\*/g;
+  const matches: Array<{ headline: string; startIdx: number; bodyStartIdx: number }> = [];
   let match: RegExpExecArray | null;
-  while ((match = itemRegex.exec(markdown)) !== null) {
-    const rawHeadline = match[1]
+  while ((match = itemHeaderRegex.exec(markdown)) !== null) {
+    matches.push({
+      headline: match[1].trim(),
+      startIdx: match.index,
+      bodyStartIdx: match.index + match[0].length,
+    });
+  }
+
+  for (let i = 0; i < matches.length; i += 1) {
+    const current = matches[i];
+    const nextStart = i + 1 < matches.length ? matches[i + 1].startIdx : markdown.length;
+    const itemBlock = markdown.slice(current.bodyStartIdx, Math.min(nextStart, current.bodyStartIdx + 800));
+
+    const rawHeadline = current.headline
       .replace(/`+/g, "")
       .replace(/（[^）]*）/g, "")
       .replace(/\([^)]*\)/g, "")
       .trim();
     if (!rawHeadline) continue;
-    // Skip items that explicitly require human CAPTCHA / manual browser login
     if (/(人机验证|CAPTCHA|扫码登录|手动登录)/i.test(rawHeadline)) continue;
 
-    // Prefer actionable items containing decision/action verbs
     if (
       !/(确认|核对|归档|整理|修复|更新|同步|删除|清理|增加|添加|开启|关闭|检查|处理|发送|生成|升级)/u.test(
         rawHeadline,
@@ -528,14 +539,363 @@ export function extractSuggestedActionsFromMarkdown(markdown: string): FeedActio
     if (seenLabels.has(shortLabel)) continue;
     seenLabels.add(shortLabel);
 
+    const sessionHints = extractSessionIdHints(`${current.headline}\n${itemBlock}`);
+    const pathHints = extractPathHints(`${current.headline}\n${itemBlock}`);
+
     actions.push({
       id: createShortId("act"),
       label: shortLabel,
       kind: "wish",
-      prompt: `请直接跟进并处理这项待办：「${match[1].trim()}」`,
+      prompt: `请直接跟进并处理这项待办：「${current.headline}」`,
+      targetAgentId: sessionHints[0],
+      cwd: pathHints[0],
     });
     if (actions.length >= 3) break;
   }
 
   return actions;
+}
+
+export interface RoutableAgentCandidate {
+  id: string;
+  title: string;
+  cwd: string;
+  workspaceId?: string;
+  workspaceTitle?: string;
+  projectName?: string;
+  updatedAtMs: number;
+  isBackground?: boolean;
+}
+
+export interface FollowUpRouteDecision {
+  agentId: string;
+  title: string;
+  cwd: string;
+  workspaceId?: string;
+  routedAwayFromOrigin: boolean;
+  reason: string;
+}
+
+const FOLLOW_UP_STOPWORDS = new Set([
+  "确认",
+  "是否",
+  "请直接",
+  "跟进",
+  "处理",
+  "这项",
+  "待办",
+  "继续",
+  "帮我",
+  "一下",
+  "这个",
+  "那个",
+  "问题",
+  "功能",
+  "工作区",
+  "会话",
+  "子会话",
+  "任务",
+  "可以",
+  "好的",
+  "麻烦",
+]);
+
+export function extractSessionIdHints(text: string): string[] {
+  const results: string[] = [];
+  const add = (id: string) => {
+    const clean = id.trim();
+    if (clean && !results.includes(clean)) results.push(clean);
+  };
+
+  // 1. conversation://<uuid-or-prefix>
+  const convRe = /conversation:\/\/([0-9a-fA-F]{7,36}(?:-[0-9a-fA-F]{4,12})*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = convRe.exec(text)) !== null) add(m[1]);
+
+  // 2. Explicit Chinese/English label: 会话 `787df7e`, 子会话 529a6b8, session `abc1234`
+  const labeledRe =
+    /(?:子?会话|session|agent)\s*[：:（(\s`'"「]*([0-9a-fA-F]{7,36}(?:-[0-9a-fA-F]{4,12})*)/gi;
+  while ((m = labeledRe.exec(text)) !== null) add(m[1]);
+
+  // 3. Full UUID anywhere in text
+  const uuidRe =
+    /\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b/g;
+  while ((m = uuidRe.exec(text)) !== null) add(m[1]);
+
+  return results;
+}
+
+function extractWorkspaceTitleHints(text: string): string[] {
+  const results: string[] = [];
+  const re = /(?:工作区|workspace)\s*[「“"'《]([^」”"'》\n]{2,80})[」”"'》]/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const clean = m[1].trim();
+    if (clean && !results.includes(clean)) results.push(clean);
+  }
+  return results;
+}
+
+function extractPathHints(text: string): string[] {
+  const results: string[] = [];
+  const fileUriRe = /file:\/\/(\/[^\s)#"'`>\]]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = fileUriRe.exec(text)) !== null) {
+    const clean = decodeURIComponent(m[1]).trim();
+    if (clean && !results.includes(clean)) results.push(clean);
+  }
+  const absRe = /(?:^|[\s`'"(（])((?:~\/|\/Users\/|\/home\/)[^\s`'")）>,，。；;\]]+)/g;
+  while ((m = absRe.exec(text)) !== null) {
+    const clean = expandHomePath(m[1].trim());
+    if (clean && !results.includes(clean)) results.push(clean);
+  }
+  return results;
+}
+
+function extractSearchTokens(text: string): {
+  asciiTerms: string[];
+  cjkBigrams: string[];
+} {
+  const cleaned = text
+    .replace(/file:\/\/[^\s)]+/g, " ")
+    .replace(/请直接跟进并处理这项待办/g, " ")
+    .toLowerCase();
+
+  const asciiSet = new Set<string>();
+  const asciiRe = /[a-z0-9][a-z0-9._@-]{2,40}/g;
+  let m: RegExpExecArray | null;
+  while ((m = asciiRe.exec(cleaned)) !== null) {
+    const tok = m[0];
+    if (!/^(http|https|file|json|html|true|false|null|users|documents)$/.test(tok)) {
+      asciiSet.add(tok);
+    }
+  }
+
+  const cjkSet = new Set<string>();
+  const cjkChunks = cleaned.match(/[\u4e00-\u9fa5]{2,}/g) ?? [];
+  for (const chunk of cjkChunks) {
+    if (FOLLOW_UP_STOPWORDS.has(chunk)) continue;
+    if (chunk.length <= 4) {
+      cjkSet.add(chunk);
+    }
+    for (let i = 0; i <= chunk.length - 2; i += 1) {
+      const bg = chunk.slice(i, i + 2);
+      if (!FOLLOW_UP_STOPWORDS.has(bg)) {
+        cjkSet.add(bg);
+      }
+    }
+  }
+
+  return {
+    asciiTerms: [...asciiSet],
+    cjkBigrams: [...cjkSet],
+  };
+}
+
+function scoreTextOverlap(
+  tokens: { asciiTerms: string[]; cjkBigrams: string[] },
+  haystack: string,
+): number {
+  if (!haystack) return 0;
+  const lower = haystack.toLowerCase();
+  let score = 0;
+  for (const term of tokens.asciiTerms) {
+    if (lower.includes(term)) {
+      score += term.includes("-") || term.includes("@") ? 18 : 12;
+    }
+  }
+  for (const bg of tokens.cjkBigrams) {
+    if (lower.includes(bg)) {
+      score += bg.length >= 3 ? 6 : 3;
+    }
+  }
+  return score;
+}
+
+function splitMarkdownIntoBlocks(markdown: string): string[] {
+  if (!markdown) return [];
+  const lines = markdown.split("\n");
+  const blocks: string[] = [];
+  let current: string[] = [];
+
+  for (const line of lines) {
+    const isBoundary =
+      /^[ \t]*(?:\d+\.[ \t]+\*\*|###?[ \t]+)/.test(line) && current.length > 0;
+    if (isBoundary) {
+      blocks.push(current.join("\n").trim());
+      current = [line];
+    } else {
+      current.push(line);
+    }
+  }
+  if (current.length > 0) {
+    blocks.push(current.join("\n").trim());
+  }
+  return blocks.filter((b) => b.length > 0);
+}
+
+function findAgentByIdOrPrefix(
+  hint: string,
+  candidates: readonly RoutableAgentCandidate[],
+): RoutableAgentCandidate | undefined {
+  const lower = hint.trim().toLowerCase();
+  if (!lower) return undefined;
+  return (
+    candidates.find((c) => c.id.toLowerCase() === lower) ??
+    candidates.find((c) => c.id.toLowerCase().startsWith(lower))
+  );
+}
+
+export function routeFollowUpCandidate(input: {
+  followUpPrompt: string;
+  cardMarkdown: string;
+  fallbackAgentId?: string;
+  explicitTargetAgentHint?: string;
+  candidates: readonly RoutableAgentCandidate[];
+}): FollowUpRouteDecision | null {
+  const usable = input.candidates.filter((c) => !c.isBackground);
+  if (usable.length === 0) return null;
+
+  const fallback = input.fallbackAgentId
+    ? usable.find((c) => c.id === input.fallbackAgentId)
+    : undefined;
+
+  const makeDecision = (
+    chosen: RoutableAgentCandidate,
+    reason: string,
+  ): FollowUpRouteDecision => ({
+    agentId: chosen.id,
+    title: chosen.workspaceTitle || chosen.title || chosen.projectName || chosen.id.slice(0, 8),
+    cwd: chosen.cwd,
+    workspaceId: chosen.workspaceId,
+    routedAwayFromOrigin: Boolean(input.fallbackAgentId && chosen.id !== input.fallbackAgentId),
+    reason,
+  });
+
+  // 1. Explicit target hint from action button or user prompt
+  if (input.explicitTargetAgentHint) {
+    const matched = findAgentByIdOrPrefix(input.explicitTargetAgentHint, usable);
+    if (matched) {
+      return makeDecision(matched, `explicit_action_target:${input.explicitTargetAgentHint}`);
+    }
+  }
+
+  const promptSessionHints = extractSessionIdHints(input.followUpPrompt);
+  for (const hint of promptSessionHints) {
+    const matched = findAgentByIdOrPrefix(hint, usable);
+    if (matched) {
+      return makeDecision(matched, `prompt_session_id:${hint}`);
+    }
+  }
+
+  // 2. Match user follow-up against individual sections/items of the summary card
+  const queryTokens = extractSearchTokens(input.followUpPrompt);
+  const blocks = splitMarkdownIntoBlocks(input.cardMarkdown);
+
+  let bestBlock = "";
+  let bestBlockScore = 0;
+  for (const blk of blocks) {
+    const sc = scoreTextOverlap(queryTokens, blk);
+    if (sc > bestBlockScore) {
+      bestBlockScore = sc;
+      bestBlock = blk;
+    }
+  }
+
+  // Only extract block-level hints when the user's follow-up clearly targets a specific block
+  if (bestBlock && bestBlockScore >= 9) {
+    // 2a. Explicit session ID cited inside the matched summary block (e.g. 会话 `787df7e`)
+    const blockSessionHints = extractSessionIdHints(bestBlock);
+    for (const hint of blockSessionHints) {
+      const matched = findAgentByIdOrPrefix(hint, usable);
+      if (matched) {
+        return makeDecision(matched, `matched_block_session:${hint}`);
+      }
+    }
+
+    // 2b. Explicit workspace title cited inside the matched summary block (e.g. 工作区「排查软件语音转文字失败问题」)
+    const wsHints = extractWorkspaceTitleHints(bestBlock);
+    for (const wsTitle of wsHints) {
+      const lowerWs = wsTitle.toLowerCase();
+      const wsMatches = usable
+        .filter(
+          (c) =>
+            c.id !== input.fallbackAgentId &&
+            (c.workspaceTitle?.toLowerCase() === lowerWs ||
+              c.title.toLowerCase() === lowerWs ||
+              c.workspaceTitle?.toLowerCase().includes(lowerWs)),
+        )
+        .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+      if (wsMatches[0]) {
+        return makeDecision(wsMatches[0], `matched_block_workspace:${wsTitle}`);
+      }
+    }
+  }
+
+  // 3. Score non-origin candidates directly by path hints + title/workspace/cwd keyword overlap
+  const combinedPathHints = [
+    ...extractPathHints(input.followUpPrompt),
+    ...(bestBlockScore >= 9 ? extractPathHints(bestBlock) : []),
+  ];
+  const blockTokens = bestBlockScore >= 9 ? extractSearchTokens(bestBlock) : { asciiTerms: [], cjkBigrams: [] };
+
+  let bestCandidate: RoutableAgentCandidate | undefined;
+  let bestCandidateScore = 0;
+
+  for (const cand of usable) {
+    if (cand.id === input.fallbackAgentId) continue;
+    const metaHaystack = [
+      cand.title,
+      cand.workspaceTitle ?? "",
+      cand.projectName ?? "",
+      path.basename(cand.cwd),
+    ].join(" ");
+
+    let score = scoreTextOverlap(queryTokens, metaHaystack) * 1.5;
+    if (bestBlockScore >= 9) {
+      score += scoreTextOverlap(blockTokens, metaHaystack) * 0.5;
+    }
+
+    const normCandCwd = path.resolve(cand.cwd);
+    for (const pHint of combinedPathHints) {
+      const normHint = path.resolve(pHint);
+      if (
+        normHint === normCandCwd ||
+        normHint.startsWith(`${normCandCwd}${path.sep}`) ||
+        normCandCwd.startsWith(`${normHint}${path.sep}`)
+      ) {
+        // Avoid boosting generic homeCwd matches unless specific project folder matches
+        if (!/\/KnowledgeBase$/i.test(normCandCwd)) {
+          score += 28;
+        }
+      }
+      const baseSlug = path.basename(normHint).toLowerCase();
+      if (baseSlug.length >= 4 && metaHaystack.toLowerCase().includes(baseSlug)) {
+        score += 22;
+      }
+    }
+
+    if (
+      score > bestCandidateScore ||
+      (score === bestCandidateScore &&
+        score > 0 &&
+        bestCandidate &&
+        cand.updatedAtMs > bestCandidate.updatedAtMs)
+    ) {
+      bestCandidateScore = score;
+      bestCandidate = cand;
+    }
+  }
+
+  // Require strong confidence (>= 20) to route away from the origin session
+  if (bestCandidate && bestCandidateScore >= 20) {
+    return makeDecision(bestCandidate, `semantic_session_match:${Math.round(bestCandidateScore)}`);
+  }
+
+  // 4. Fallback to the origin session that produced the card
+  if (fallback) {
+    return makeDecision(fallback, "origin_card_session");
+  }
+
+  return null;
 }

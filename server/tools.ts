@@ -11,12 +11,16 @@ import { createShortId } from "./storage";
 import type { ProactiveEngine } from "./engine";
 
 const ToolActionInputSchema = z.object({
-  label: z.string().min(1).describe("Short button label, e.g. '一键归档' or '2小时后复查'"),
+  label: z.string().min(1).describe("Short button label, e.g. '一键归档' or '2小时后再提醒'"),
   kind: z
     .enum(["delegate", "wish", "self_wake"])
-    .describe("delegate = background worker, wish = Chief follow-up, self_wake = scheduled check"),
+    .describe("delegate = background worker, wish = continue in session, self_wake = scheduled check"),
   prompt: z.string().min(1).describe("Actionable instructions executed when the user taps this button"),
   cwd: z.string().optional().describe("Optional target workspace directory"),
+  targetAgentId: z
+    .string()
+    .optional()
+    .describe("Optional specific session/agent ID (or prefix) to route this follow-up action directly into"),
   delayMinutes: z
     .number()
     .min(1)
@@ -241,6 +245,7 @@ export function registerBotAgentTools(
         kind: act.kind,
         prompt: act.prompt,
         cwd: act.cwd || agent.cwd || undefined,
+        targetAgentId: act.targetAgentId?.trim() || undefined,
         delayMinutes: act.delayMinutes,
       }));
 

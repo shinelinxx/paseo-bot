@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 430" width="560" height="430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <rect width="560" height="430" rx="14" fill="#0d1017" stroke="#23293a" stroke-width="1.5"/>
+
+  <rect x="18" y="18" width="524" height="394" rx="14" fill="#151924" stroke="#262d40"/>
+
+  <text x="36" y="48" fill="#f8fafc" font-size="16" font-weight="700">New Automatic Rule</text>
+  <text x="514" y="48" fill="#64748b" font-size="15">✕</text>
+  <line x1="18" y1="64" x2="542" y2="64" stroke="#242b3d"/>
+
+  <text x="36" y="90" fill="#e2e8f0" font-size="12" font-weight="600">Describe what you want to automate in one sentence</text>
+  <rect x="36" y="100" width="488" height="40" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="125" fill="#f1f5f9" font-size="13">Every morning at 09:00 check OrderHub anomalies and email a summary</text>
+
+  <rect x="36" y="150" width="218" height="24" rx="12" fill="#1c2231" stroke="#2d354b"/>
+  <text x="145" y="166" fill="#cbd5e1" font-size="11" text-anchor="middle">Every day at 08:30 summarize inbox</text>
+
+  <rect x="262" y="150" width="218" height="24" rx="12" fill="#1c2231" stroke="#2d354b"/>
+  <text x="371" y="166" fill="#cbd5e1" font-size="11" text-anchor="middle">Watch ~/Downloads for new files</text>
+
+  <rect x="36" y="184" width="488" height="34" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="280" y="206" fill="#e2e8f0" font-size="13" font-weight="700" text-anchor="middle">Regenerate Rule</text>
+
+  <rect x="36" y="230" width="488" height="92" rx="10" fill="#1c2231" stroke="#6366f1"/>
+  <text x="50" y="250" fill="#818cf8" font-size="11" font-weight="700">Rule Preview</text>
+  <text x="50" y="272" fill="#f8fafc" font-size="14" font-weight="700">09:00 · Every morning at 09:00 check OrderHub…</text>
+  <text x="50" y="292" fill="#e2e8f0" font-size="12">Daily at 09:00 · Ask before running · ~/Documents/OrderHub</text>
+  <text x="50" y="310" fill="#94a3b8" font-size="11">Runs daily at 09:00 and stages outbound email drafts for confirmation first.</text>
+
+  <text x="36" y="344" fill="#94a3b8" font-size="12">▾ More parameters (File change / Command or URL check / Webhook / Schedule)</text>
+
+  <rect x="36" y="358" width="488" height="40" rx="9" fill="#6366f1"/>
+  <text x="280" y="383" fill="#ffffff" font-size="14" font-weight="700" text-anchor="middle">Enable Rule</text>
+</svg>

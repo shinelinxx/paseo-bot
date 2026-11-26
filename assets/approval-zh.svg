@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 430" width="560" height="430" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif">
+  <rect width="560" height="430" rx="14" fill="#0d1017" stroke="#23293a" stroke-width="1.5"/>
+
+  <!-- Card Container -->
+  <rect x="18" y="18" width="524" height="394" rx="14" fill="#151924" stroke="#f59e0b" stroke-width="1.2"/>
+
+  <!-- Header -->
+  <text x="36" y="48" fill="#f8fafc" font-size="15" font-weight="700">发送 11 月项目对账汇总邮件</text>
+  <rect x="468" y="32" width="56" height="22" rx="11" fill="#1e2434"/>
+  <text x="496" y="47" fill="#f59e0b" font-size="11" font-weight="700" text-anchor="middle">中风险</text>
+
+  <text x="36" y="74" fill="#cbd5e1" font-size="13">已整理本月账单核对结果，准备发送给财务邮箱归档。</text>
+  <text x="36" y="94" fill="#64748b" font-size="11">账单检查  ·  ~/Documents/KnowledgeBase  ·  11-26 09:02</text>
+
+  <!-- Execution Content Header -->
+  <text x="36" y="122" fill="#818cf8" font-size="12" font-weight="600">▴ 收起执行内容</text>
+  <text x="462" y="122" fill="#94a3b8" font-size="11">✎ 修改内容</text>
+
+  <!-- Editable Execution Preview Box -->
+  <rect x="36" y="132" width="488" height="114" rx="9" fill="#1c2231" stroke="#6366f1" stroke-width="1"/>
+  <text x="50" y="154" fill="#f1f5f9" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">To: finance@example.com</text>
+  <text x="50" y="174" fill="#f1f5f9" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">Subject: 11月账单核对汇总（共 12 笔，无异常）</text>
+  <text x="50" y="198" fill="#cbd5e1" font-size="12">你好，本月对账单已核对完毕，明细见附件表格。</text>
+  <text x="50" y="218" fill="#cbd5e1" font-size="12">其中云服务新增测试节点 $24.00 已确认为正常扩容。</text>
+
+  <!-- Repeat Confirmation Hint -->
+  <rect x="36" y="258" width="488" height="32" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="278" fill="#94a3b8" font-size="11">这项操作已手动确认过 2 次，确认无误后可改为自动执行</text>
+
+  <!-- Optional Note Input -->
+  <rect x="36" y="302" width="488" height="36" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="325" fill="#64748b" font-size="12">补充说明或拒绝原因（选填，后续会自动参考）…</text>
+
+  <!-- 3-Tier Confirmation Buttons -->
+  <rect x="36" y="352" width="186" height="40" rx="9" fill="#6366f1"/>
+  <text x="129" y="377" fill="#ffffff" font-size="13" font-weight="700" text-anchor="middle">✓ 按修改后执行</text>
+
+  <rect x="230" y="352" width="204" height="40" rx="9" fill="#1c2231" stroke="#6366f1"/>
+  <text x="332" y="377" fill="#818cf8" font-size="12" font-weight="700" text-anchor="middle">⚡ 确认，以后自动执行</text>
+
+  <rect x="442" y="352" width="82" height="40" rx="9" fill="#1c2231" stroke="#2d354b"/>
+  <text x="483" y="377" fill="#e2e8f0" font-size="13" text-anchor="middle">✕ 拒绝</text>
+</svg>

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 430" width="560" height="430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <rect width="560" height="430" rx="14" fill="#0d1017" stroke="#23293a" stroke-width="1.5"/>
+
+  <rect x="18" y="18" width="524" height="394" rx="14" fill="#151924" stroke="#f59e0b" stroke-width="1.2"/>
+
+  <text x="36" y="48" fill="#f8fafc" font-size="15" font-weight="700">Send November invoice reconciliation email</text>
+  <rect x="444" y="32" width="80" height="22" rx="11" fill="#1e2434"/>
+  <text x="484" y="47" fill="#f59e0b" font-size="11" font-weight="700" text-anchor="middle">Medium risk</text>
+
+  <text x="36" y="74" fill="#cbd5e1" font-size="13">Prepared monthly reconciliation report to send to finance@example.com.</text>
+  <text x="36" y="94" fill="#64748b" font-size="11">Invoice Check  ·  ~/Documents/KnowledgeBase  ·  11-26 09:02</text>
+
+  <text x="36" y="122" fill="#818cf8" font-size="12" font-weight="600">▴ Hide execution details</text>
+  <text x="446" y="122" fill="#94a3b8" font-size="11">✎ Edit content</text>
+
+  <rect x="36" y="132" width="488" height="114" rx="9" fill="#1c2231" stroke="#6366f1"/>
+  <text x="50" y="154" fill="#f1f5f9" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">To: finance@example.com</text>
+  <text x="50" y="174" fill="#f1f5f9" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">Subject: November Invoice Summary (12 items, verified)</text>
+  <text x="50" y="198" fill="#cbd5e1" font-size="12">Hi team, all 12 November invoices have been reconciled.</text>
+  <text x="50" y="218" fill="#cbd5e1" font-size="12">The $24.00 staging node increase was verified as planned scaling.</text>
+
+  <rect x="36" y="258" width="488" height="32" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="278" fill="#94a3b8" font-size="11">Confirmed 2 time(s) previously — you can switch this rule to run automatically</text>
+
+  <rect x="36" y="302" width="488" height="36" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="325" fill="#64748b" font-size="12">Optional note or reason for declining (saved for future runs)...</text>
+
+  <rect x="36" y="352" width="150" height="40" rx="9" fill="#6366f1"/>
+  <text x="111" y="377" fill="#ffffff" font-size="13" font-weight="700" text-anchor="middle">✓ Run Edited</text>
+
+  <rect x="194" y="352" width="234" height="40" rx="9" fill="#1c2231" stroke="#6366f1"/>
+  <text x="311" y="377" fill="#818cf8" font-size="12" font-weight="700" text-anchor="middle">⚡ Confirm &amp; Auto-Run Next Time</text>
+
+  <rect x="436" y="352" width="88" height="40" rx="9" fill="#1c2231" stroke="#2d354b"/>
+  <text x="480" y="377" fill="#e2e8f0" font-size="13" text-anchor="middle">✕ Decline</text>
+</svg>

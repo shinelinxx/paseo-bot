@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 430" width="560" height="430" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif">
+  <rect width="560" height="430" rx="14" fill="#0d1017" stroke="#23293a" stroke-width="1.5"/>
+
+  <!-- Modal Container -->
+  <rect x="18" y="18" width="524" height="394" rx="14" fill="#151924" stroke="#262d40" stroke-width="1"/>
+
+  <!-- Modal Header -->
+  <text x="36" y="48" fill="#f8fafc" font-size="16" font-weight="700">新建自动规则</text>
+  <text x="514" y="48" fill="#64748b" font-size="15">✕</text>
+  <line x1="18" y1="64" x2="542" y2="64" stroke="#242b3d"/>
+
+  <!-- Natural Language Input -->
+  <text x="36" y="90" fill="#e2e8f0" font-size="12" font-weight="600">用一句话描述你想自动跟进的事</text>
+  <rect x="36" y="100" width="488" height="40" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="48" y="125" fill="#f1f5f9" font-size="13">每天早上 09:00 检查 OrderHub 待办异常并发送邮件提醒</text>
+
+  <!-- Example Chips -->
+  <rect x="36" y="150" width="176" height="24" rx="12" fill="#1c2231" stroke="#2d354b"/>
+  <text x="124" y="166" fill="#cbd5e1" font-size="11" text-anchor="middle">每天 08:30 汇总收件箱与待办</text>
+
+  <rect x="220" y="150" width="176" height="24" rx="12" fill="#1c2231" stroke="#2d354b"/>
+  <text x="308" y="166" fill="#cbd5e1" font-size="11" text-anchor="middle">监听 ~/Downloads 新文件归类</text>
+
+  <!-- Secondary Generate Button -->
+  <rect x="36" y="184" width="488" height="34" rx="8" fill="#1c2231" stroke="#2d354b"/>
+  <text x="280" y="206" fill="#e2e8f0" font-size="13" font-weight="700" text-anchor="middle">重新生成规则方案</text>
+
+  <!-- Generated Rule Preview Card -->
+  <rect x="36" y="230" width="488" height="92" rx="10" fill="#1c2231" stroke="#6366f1"/>
+  <text x="50" y="250" fill="#818cf8" font-size="11" font-weight="700">规则预览</text>
+  <text x="50" y="272" fill="#f8fafc" font-size="14" font-weight="700">09:00 · 每天早上 09:00 检查 OrderHub…</text>
+  <text x="50" y="292" fill="#e2e8f0" font-size="12">每天 09:00 定时运行 · 执行前需确认 · 目录 ~/Documents/OrderHub</text>
+  <text x="50" y="310" fill="#94a3b8" font-size="11">将在每天 09:00 定时运行检查，涉及外发邮件时先停留在待确认列表。</text>
+
+  <!-- Collapsed More Parameters -->
+  <text x="36" y="344" fill="#94a3b8" font-size="12">▾ 更多参数设置（文件变动 / 命令或网页检测 / Webhook 回调 / 定时运行）</text>
+
+  <!-- Primary Activate Button -->
+  <rect x="36" y="358" width="488" height="40" rx="9" fill="#6366f1"/>
+  <text x="280" y="383" fill="#ffffff" font-size="14" font-weight="700" text-anchor="middle">启用规则</text>
+</svg>

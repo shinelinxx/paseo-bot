@@ -22,6 +22,7 @@ import {
   type FeedItem,
   type FeedLevel,
   type MissionDraft,
+  type NativeScheduleItem,
   type PresetId,
   type TriggerSpec,
   type TriggerUpsertInput,
@@ -34,8 +35,11 @@ import {
 import {
   applyApprovalResolutionMutation,
   applyFeedCurationMutation,
+  cleanTaskTitle,
   computeRoutineSuggestions,
   draftMissionFromIntent,
+  extractSuggestedActionsFromMarkdown,
+  splitReplyIntoPreviewAndDetails,
 } from "./intent";
 import {
   appendChiefAlertCard,
@@ -131,8 +135,16 @@ export class ProactiveEngine {
     string,
     { triggerId: string; triggerName: string }
   >();
+  private readonly reportedTurnAgents = new Set<string>();
   private readonly pendingDispatches: PendingDispatch[] = [];
   private readonly regexCache = new Map<string, RegExp | null>();
+
+  private lastWorkerReconcileAt = 0;
+  private workerReconcileInFlight: Promise<void> | null = null;
+
+  private cachedNativeSchedules: NativeScheduleItem[] = [];
+  private cachedNativeSchedulesAt = 0;
+  private nativeSchedulesInFlight: Promise<NativeScheduleItem[]> | null = null;
 
   private webhookServer: http.Server | null = null;
   private activeWebhookPort: number | null = null;
@@ -280,16 +292,242 @@ export class ProactiveEngine {
   attachPaseo(paseo: PaseoApi): void {
     const wasEmpty = this.paseo === null;
     this.paseo = paseo;
-    if (wasEmpty && this.pendingDispatches.length > 0) {
-      const queued = this.pendingDispatches.splice(0, this.pendingDispatches.length);
-      for (const item of queued) {
-        void this.dispatchTrigger(item.triggerId, {
-          reason: item.reason,
-          detail: item.detail,
-          manual: item.manual,
-        });
+    if (wasEmpty) {
+      void this.reconcileWorkersWithPaseo(true);
+      if (this.pendingDispatches.length > 0) {
+        const queued = this.pendingDispatches.splice(0, this.pendingDispatches.length);
+        for (const item of queued) {
+          void this.dispatchTrigger(item.triggerId, {
+            reason: item.reason,
+            detail: item.detail,
+            manual: item.manual,
+          });
+        }
       }
     }
+  }
+
+  markTurnReported(agentId: string): void {
+    this.reportedTurnAgents.add(agentId);
+  }
+
+  private async reconcileWorkersWithPaseo(force = false): Promise<void> {
+    if (!this.paseo || this.stopped) return;
+    const now = Date.now();
+    if (!force && now - this.lastWorkerReconcileAt < 10_000) return;
+    if (this.workerReconcileInFlight) return this.workerReconcileInFlight;
+
+    const task = (async () => {
+      this.lastWorkerReconcileAt = Date.now();
+      const state = await this.store.load();
+      const activeWorkers = state.workers.filter(
+        (w) => w.status === "running" || w.status === "permission",
+      );
+      if (activeWorkers.length === 0) return;
+
+      const checks = await Promise.all(
+        activeWorkers.map(async (w) => {
+          try {
+            const refreshed = await this.paseo!.agents.ref(w.agentId).refresh();
+            return { workerId: w.id, agentId: w.agentId, refreshed };
+          } catch {
+            return { workerId: w.id, agentId: w.agentId, refreshed: null };
+          }
+        }),
+      );
+
+      let mutated = false;
+      const nowIso = new Date().toISOString();
+      await this.store.mutate((draft) => {
+        for (const { workerId, agentId, refreshed } of checks) {
+          const target = draft.workers.find((w) => w.id === workerId);
+          if (!target || (target.status !== "running" && target.status !== "permission")) {
+            continue;
+          }
+          let resolvedStatus: DelegatedWorker["status"] | null = null;
+          if (!refreshed || refreshed.agent.archivedAt) {
+            resolvedStatus = "archived";
+          } else if (
+            refreshed.agent.status === "idle" ||
+            refreshed.agent.status === "closed"
+          ) {
+            resolvedStatus = "completed";
+          } else if (refreshed.agent.status === "error") {
+            resolvedStatus = "failed";
+          }
+
+          if (resolvedStatus) {
+            target.status = resolvedStatus;
+            target.updatedAt = nowIso;
+            mutated = true;
+            for (const f of draft.feed) {
+              if (f.agentId === agentId && f.inProgress) {
+                f.inProgress = false;
+              }
+            }
+          }
+        }
+      });
+
+      if (mutated) {
+        await this.broadcastSnapshot();
+      }
+    })();
+
+    this.workerReconcileInFlight = task;
+    try {
+      await task;
+    } finally {
+      if (this.workerReconcileInFlight === task) {
+        this.workerReconcileInFlight = null;
+      }
+    }
+  }
+
+  private async fetchNativeSchedules(force = false): Promise<NativeScheduleItem[]> {
+    const now = Date.now();
+    if (
+      !force &&
+      this.cachedNativeSchedulesAt > 0 &&
+      now - this.cachedNativeSchedulesAt < 15_000
+    ) {
+      return this.cachedNativeSchedules;
+    }
+    if (this.nativeSchedulesInFlight) return this.nativeSchedulesInFlight;
+
+    const task = (async () => {
+      try {
+        const loginPath = await this.getLoginPath();
+        const { stdout } = await execCommand("paseo", ["schedule", "ls", "--json"], {
+          env: { ...process.env, PATH: loginPath },
+          timeout: 6_000,
+          maxBuffer: 256 * 1024,
+        });
+        const parsed = JSON.parse(stdout.trim() || "[]");
+        if (Array.isArray(parsed)) {
+          this.cachedNativeSchedules = parsed
+            .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+            .map((item) => ({
+              id: String(item.id ?? ""),
+              name: String(item.name ?? item.id ?? "定时任务"),
+              cadence: String(item.cadence ?? ""),
+              target: String(item.target ?? ""),
+              status: String(item.status ?? "active"),
+              nextRunAt: typeof item.nextRunAt === "string" ? item.nextRunAt : null,
+              lastRunAt: typeof item.lastRunAt === "string" ? item.lastRunAt : null,
+            }))
+            .filter((item) => item.id.length > 0);
+        }
+      } catch {
+        // Keep previous cached list if CLI is temporarily unavailable
+      }
+      this.cachedNativeSchedulesAt = Date.now();
+      return this.cachedNativeSchedules;
+    })();
+
+    this.nativeSchedulesInFlight = task;
+    try {
+      return await task;
+    } finally {
+      if (this.nativeSchedulesInFlight === task) {
+        this.nativeSchedulesInFlight = null;
+      }
+    }
+  }
+
+  async manageNativeSchedule(input: {
+    id: string;
+    action: "run_once" | "pause" | "resume";
+  }): Promise<{ ok: boolean; message: string }> {
+    const cleanId = input.id.trim();
+    if (!/^[A-Za-z0-9_-]+$/.test(cleanId)) {
+      return { ok: false, message: "无效的定时任务 ID" };
+    }
+    const subcmd =
+      input.action === "run_once"
+        ? "run-once"
+        : input.action === "pause"
+          ? "pause"
+          : "resume";
+    try {
+      const loginPath = await this.getLoginPath();
+      await execCommand("paseo", ["schedule", subcmd, cleanId], {
+        env: { ...process.env, PATH: loginPath },
+        timeout: 8_000,
+        maxBuffer: 128 * 1024,
+      });
+      await this.fetchNativeSchedules(true);
+      await this.broadcastSnapshot();
+      const label =
+        input.action === "run_once"
+          ? "已触发立即运行"
+          : input.action === "pause"
+            ? "已暂停定时任务"
+            : "已恢复定时任务";
+      return { ok: true, message: label };
+    } catch (err) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  async manageWorker(input: {
+    action: "stop" | "remove" | "clear_finished";
+    workerId?: string;
+  }): Promise<{ ok: boolean; removedCount?: number }> {
+    if (input.action === "clear_finished") {
+      let removedCount = 0;
+      await this.store.mutate((draft) => {
+        const before = draft.workers.length;
+        draft.workers = draft.workers.filter(
+          (w) => w.status === "running" || w.status === "permission",
+        );
+        removedCount = before - draft.workers.length;
+      });
+      await this.broadcastSnapshot();
+      return { ok: true, removedCount };
+    }
+
+    const targetId = input.workerId?.trim();
+    if (!targetId) return { ok: false };
+
+    if (input.action === "remove") {
+      let removed = false;
+      await this.store.mutate((draft) => {
+        const before = draft.workers.length;
+        draft.workers = draft.workers.filter((w) => w.id !== targetId);
+        removed = draft.workers.length < before;
+      });
+      if (removed) await this.broadcastSnapshot();
+      return { ok: removed, removedCount: removed ? 1 : 0 };
+    }
+
+    // stop running worker
+    const state = await this.store.load();
+    const foundWorker = state.workers.find((w) => w.id === targetId);
+    if (!foundWorker) return { ok: false };
+
+    if (this.paseo) {
+      await this.paseo.agents.ref(foundWorker.agentId).archive().catch(() => undefined);
+    }
+
+    const nowIso = new Date().toISOString();
+    await this.store.mutate((draft) => {
+      const w = draft.workers.find((item) => item.id === targetId);
+      if (w) {
+        w.status = "archived";
+        w.updatedAt = nowIso;
+      }
+      for (const f of draft.feed) {
+        if (f.agentId === foundWorker.agentId && f.inProgress) {
+          f.inProgress = false;
+        }
+      }
+    });
+    await this.broadcastSnapshot();
+    return { ok: true };
   }
 
   subscribeSnapshots(listener: (snapshot: BotSnapshot) => void): () => void {
@@ -313,11 +551,14 @@ export class ProactiveEngine {
   }
 
   async getSnapshot(opts?: { includeMemory?: boolean }): Promise<BotSnapshot> {
-    const state = await this.store.load();
-    const memoryContent =
+    await this.reconcileWorkersWithPaseo(false);
+    const [state, nativeSchedules, memoryContent] = await Promise.all([
+      this.store.load(),
+      this.fetchNativeSchedules(false),
       opts?.includeMemory === false
-        ? ""
-        : await this.store.readMemory(this.settings.memoryFilePath);
+        ? Promise.resolve("")
+        : this.store.readMemory(this.settings.memoryFilePath),
+    ]);
     let unreadCount = 0;
     for (const f of state.feed) {
       if (f.unread && f.level !== "silent") unreadCount += 1;
@@ -347,6 +588,7 @@ export class ProactiveEngine {
       runningWorkerCount,
       totalSilentChecks,
       triggers: state.triggers,
+      nativeSchedules,
       feed: state.feed.slice(0, 40),
       approvals: state.approvals.slice(0, 25),
       workers: state.workers.slice(0, 25),
@@ -1101,41 +1343,83 @@ export class ProactiveEngine {
       return { ok: true, message: `已设置 ${hrs} 后再提醒` };
     }
 
+    const fullReference = feedItem.details || feedItem.summary;
     const promptText =
       matchedAction?.prompt ||
       input.customPrompt?.trim() ||
-      `请继续跟进这项内容：「${feedItem.title}」\n背景摘要：\n${feedItem.summary}`;
+      `请继续跟进这项内容：「${feedItem.title}」`;
 
     let launchedAgentId: string | undefined;
+    let continuedExistingSession = false;
+
     if (kind === "delegate") {
       const worker = await this.delegateTask({
-        title: matchedAction?.label || `跟进 · ${feedItem.title.slice(0, 18)}`,
+        title: matchedAction?.label || `跟进 · ${cleanTaskTitle(feedItem.title).slice(0, 18)}`,
         cwd: targetCwd,
-        prompt: promptText,
+        prompt: `${promptText}\n\n--- 背景参考 ---\n${fullReference.slice(0, 6000)}`,
         isolation: "local",
         notifyChiefOnFinish: true,
       });
       launchedAgentId = worker.agentId;
-    } else {
-      const contextualWish = [
-        `针对动态「${feedItem.title}」的补充跟进：`,
-        promptText,
-        ``,
-        `--- 原动态内容 ---`,
-        feedItem.summary,
-      ].join("\n");
-      const res = await this.submitWish({ wish: contextualWish, cwd: targetCwd });
+    } else if (this.paseo && feedItem.agentId) {
+      // Directly continue in the original agent session to preserve 100% context!
+      const handle = this.paseo.agents.ref(feedItem.agentId);
+      const refreshed = await handle.refresh().catch(() => null);
+      if (refreshed && !refreshed.agent.archivedAt) {
+        await handle.send(promptText);
+        launchedAgentId = feedItem.agentId;
+        continuedExistingSession = true;
+      }
+    }
+
+    if (!launchedAgentId) {
+      const baseTitle = cleanTaskTitle(feedItem.title).slice(0, 22);
+      const res = await this.submitWish({
+        wish: promptText,
+        cwd: targetCwd,
+        titleOverride: matchedAction?.label || `跟进 · ${baseTitle}`,
+        extraContext: fullReference.slice(0, 6000),
+      });
       launchedAgentId = res.agentId;
     }
 
     let updatedFeed: FeedItem | undefined;
     await this.store.mutate((draft) => {
-      const found = draft.feed.find((f) => f.id === input.feedId);
-      if (!found) return;
+      const idx = draft.feed.findIndex((f) => f.id === input.feedId);
+      if (idx === -1) return;
+      const found = draft.feed[idx];
       found.unread = false;
       if (matchedAction) {
         const act = found.actions.find((a) => a.id === matchedAction.id);
         if (act) act.executedAt = nowIso;
+      }
+      if (continuedExistingSession && launchedAgentId) {
+        found.inProgress = true;
+        found.createdAt = nowIso;
+        // Move card to top so user sees live progress in place
+        draft.feed.splice(idx, 1);
+        draft.feed.unshift(found);
+
+        const existingWorker = draft.workers.find((w) => w.agentId === launchedAgentId);
+        if (existingWorker) {
+          existingWorker.status = "running";
+          existingWorker.updatedAt = nowIso;
+        } else {
+          draft.workers.unshift({
+            id: createShortId("wish"),
+            agentId: launchedAgentId,
+            workspaceId: found.workspaceId,
+            title: cleanTaskTitle(found.title).slice(0, 28) || "继续追问",
+            cwd: targetCwd,
+            provider: this.settings.chiefProvider,
+            isolation: "local",
+            status: "running",
+            goal: promptText.slice(0, 1000),
+            notifyChiefOnFinish: false,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+        }
       }
       updatedFeed = { ...found };
     });
@@ -1145,7 +1429,9 @@ export class ProactiveEngine {
     await this.broadcastSnapshot();
     return {
       ok: true,
-      message: `已开始跟进：${matchedAction?.label || "继续处理"}`,
+      message: continuedExistingSession
+        ? "已在原会话继续跟进，完成后将自动更新卡片"
+        : `已开始跟进：${matchedAction?.label || "继续处理"}`,
       agentId: launchedAgentId,
     };
   }
@@ -1156,6 +1442,8 @@ export class ProactiveEngine {
     summary: string;
     details?: string;
     actions?: FeedAction[];
+    inProgress?: boolean;
+    unread?: boolean;
     triggerId?: string;
     triggerName?: string;
     agentId?: string;
@@ -1172,11 +1460,12 @@ export class ProactiveEngine {
       summary: input.summary,
       details: input.details,
       actions: input.actions ?? [],
+      inProgress: input.inProgress ?? false,
       triggerId: input.triggerId,
       triggerName: input.triggerName,
       agentId: input.agentId,
       workspaceId: input.workspaceId,
-      unread: input.level !== "silent",
+      unread: input.unread ?? (input.level !== "silent" && !input.inProgress),
     };
 
     let chiefId: string | null = null;
@@ -1199,6 +1488,82 @@ export class ProactiveEngine {
       await appendChiefAlertCard(this.paseo, chiefId, item);
     }
     return item;
+  }
+
+  async upsertAgentFeedCard(input: {
+    agentId: string;
+    workspaceId?: string;
+    level: FeedLevel;
+    title: string;
+    summary: string;
+    details?: string;
+    actions?: FeedAction[];
+    notifyDesktop?: boolean;
+    appendChiefTimeline?: boolean;
+    beforeMutate?: (draft: import("./storage").PersistedBotState) => void;
+  }): Promise<FeedItem> {
+    const nowIso = new Date().toISOString();
+    let finalItem!: FeedItem;
+    let chiefId: string | null = null;
+
+    await this.store.mutate((draft) => {
+      input.beforeMutate?.(draft);
+      chiefId = draft.chiefAgentId;
+
+      // Find an in-progress or initial 'wish' card for this same agentId to update in place
+      const existingIdx = draft.feed.findIndex(
+        (f) => f.agentId === input.agentId && (f.inProgress || f.level === "wish"),
+      );
+
+      if (existingIdx >= 0) {
+        const target = draft.feed[existingIdx];
+        target.createdAt = nowIso;
+        target.level = input.level;
+        target.title = input.title;
+        target.summary = input.summary;
+        target.details = input.details;
+        if (input.actions && input.actions.length > 0) {
+          target.actions = input.actions;
+        }
+        target.inProgress = false;
+        target.unread = input.level !== "silent";
+        if (input.workspaceId) target.workspaceId = input.workspaceId;
+        draft.feed.splice(existingIdx, 1);
+        draft.feed.unshift(target);
+        finalItem = { ...target };
+      } else {
+        const created: FeedItem = {
+          id: createShortId("feed"),
+          createdAt: nowIso,
+          level: input.level,
+          title: input.title,
+          summary: input.summary,
+          details: input.details,
+          actions: input.actions ?? [],
+          inProgress: false,
+          agentId: input.agentId,
+          workspaceId: input.workspaceId,
+          unread: input.level !== "silent",
+        };
+        draft.feed.unshift(created);
+        finalItem = { ...created };
+      }
+    });
+
+    await this.broadcastSnapshot();
+
+    if (input.notifyDesktop && input.level !== "silent") {
+      void sendDesktopNotification({
+        enabled: this.settings.desktopNotify,
+        title: `Paseo Bot · ${finalItem.title}`,
+        subtitle: finalItem.triggerName,
+        body: finalItem.summary,
+      });
+    }
+    if (input.appendChiefTimeline !== false && input.level !== "silent") {
+      await appendChiefAlertCard(this.paseo, chiefId, finalItem);
+    }
+    return finalItem;
   }
 
   async createApproval(input: {
@@ -1410,6 +1775,8 @@ export class ProactiveEngine {
   async submitWish(input: {
     wish: string;
     cwd?: string;
+    titleOverride?: string;
+    extraContext?: string;
   }): Promise<{ agentId: string; workspaceId: string | null }> {
     if (!this.paseo) {
       throw new Error("Paseo daemon connection is not initialized yet");
@@ -1417,23 +1784,33 @@ export class ProactiveEngine {
 
     const cleanWish = input.wish.trim();
     const contextNote = input.cwd ? `\n(Submitted from workspace directory: ${input.cwd})` : "";
+    const refBlock = input.extraContext
+      ? `\n\n--- Reference Context ---\n${input.extraContext}`
+      : "";
     const wishPrompt = [
-      `[User Wish / Goal]`,
-      cleanWish + contextNote,
+      `[User Task / Goal]`,
+      cleanWish + contextNote + refBlock,
       ``,
-      `Please analyze and execute this wish as Paseo Bot (Chief of Staff):`,
-      `- If it requires ongoing monitoring or scheduled follow-up, configure or update the appropriate trigger via \`paseo_bot_create_trigger\` or \`paseo_bot_self_wake\`.`,
-      `- If it requires heavy coding or work in another workspace/worktree, you can either handle it directly here or delegate sub-work asynchronously via \`paseo_bot_delegate_task\`.`,
-      `- If it establishes a long-term goal or preference, record it in \`MEMORY.md\` via \`paseo_bot_memory_write\`.`,
-      `- Reply concisely with your findings or what you set up.`,
+      `Execution Guidelines:`,
+      `- If this requires ongoing monitoring or scheduled checks, configure or update a rule via \`paseo_bot_create_trigger\` or \`paseo_bot_self_wake\`.`,
+      `- If it requires work in another workspace/worktree, handle it directly or delegate via \`paseo_bot_delegate_task\`.`,
+      `- If it establishes a long-term preference or filter, save it in \`MEMORY.md\` via \`paseo_bot_memory_write\`.`,
+      `- When presenting findings that include 1-3 concrete follow-up decisions or optional actions for the user, call \`paseo_bot_report_outcome\` (\`level: "notify"\`) with a concise \`summary\`, full \`details\` (if long), and 1-3 one-tap \`actions\` buttons so the user can click instead of typing.`,
     ].join("\n");
+
+    const baseLabel =
+      input.titleOverride?.trim() ||
+      cleanTaskTitle(cleanWish).replace(/\s+/g, " ").slice(0, 26) +
+        (cleanWish.length > 26 ? "…" : "");
 
     if (this.settings.wishSessionMode === "shared_chief") {
       const ensured = await this.ensureChiefBot();
       await this.pushFeed({
         level: "wish",
-        title: "已提交新任务",
+        title: `正在处理：${baseLabel}`,
         summary: cleanWish,
+        inProgress: true,
+        unread: false,
         agentId: ensured.agentId,
         workspaceId: ensured.workspaceId ?? undefined,
         notifyDesktop: false,
@@ -1458,8 +1835,6 @@ export class ProactiveEngine {
       this.settings.chiefModeId,
     );
 
-    const shortTitle =
-      cleanWish.replace(/\s+/g, " ").slice(0, 26) + (cleanWish.length > 26 ? "…" : "");
     const wishWorkerId = createShortId("wish");
 
     const wishAgent = await workspace.agents.create({
@@ -1467,12 +1842,12 @@ export class ProactiveEngine {
         provider: launch.provider,
         modeId: launch.modeId,
         systemPrompt: [
-          "You are Paseo Bot, the user's Chief-of-Staff agent handling a dedicated Wish thread.",
-          "You share global persistent memory (`MEMORY.md`) and global proactive triggers (`paseo_bot_*`) across all Wish threads.",
-          "Enforce Sentinel safety: never send external emails/messages, spend money, or make destructive changes without setting `governance: 'require_approval'` or calling `paseo_bot_request_approval`.",
+          "You are Paseo Bot handling a dedicated background task thread.",
+          "You share persistent memory (`MEMORY.md`) and automatic rules (`paseo_bot_*`) across all threads.",
+          "Never send external emails/messages, spend money, or make destructive changes without calling `paseo_bot_request_approval` with `payloadPreview`.",
         ].join("\n"),
       },
-      title: `任务 · ${shortTitle}`,
+      title: baseLabel,
       prompt: wishPrompt,
       labels: {
         "paseo-bot/role": "chief",
@@ -1486,7 +1861,7 @@ export class ProactiveEngine {
       id: wishWorkerId,
       agentId: wishAgent.id,
       workspaceId,
-      title: `任务 · ${shortTitle}`,
+      title: baseLabel,
       cwd: targetCwd,
       provider: launch.provider,
       isolation: "local",
@@ -1499,8 +1874,10 @@ export class ProactiveEngine {
 
     await this.pushFeed({
       level: "wish",
-      title: `已开始处理：${shortTitle}`,
+      title: `正在处理：${baseLabel}`,
       summary: cleanWish,
+      inProgress: true,
+      unread: false,
       agentId: wishAgent.id,
       workspaceId,
       notifyDesktop: false,
@@ -1585,11 +1962,14 @@ export class ProactiveEngine {
 
     await this.pushFeed({
       level: "worker_update",
-      title: `已启动子任务：${record.title}`,
-      summary: `工作区：${record.cwd} (${record.isolation})\n模型：${record.provider}`,
+      title: `正在执行：${cleanTaskTitle(record.title)}`,
+      summary: `工作目录：${record.cwd} (${record.isolation})\n模型：${record.provider}`,
+      inProgress: true,
+      unread: false,
       agentId: record.agentId,
       workspaceId: record.workspaceId,
       notifyDesktop: false,
+      appendChiefTimeline: false,
       beforeMutate: (draft) => {
         draft.workers.unshift(record);
       },
@@ -2019,10 +2399,14 @@ export class ProactiveEngine {
           } else if (runRes.status === "error") {
             throw new Error(runRes.error || "Scout helper ended with error");
           } else {
+            const split = splitReplyIntoPreviewAndDetails(text);
+            const autoActions = extractSuggestedActionsFromMarkdown(text);
             await this.pushFeed({
               level: "notify",
               title: trigger.name,
-              summary: text.slice(0, 1500),
+              summary: split.summary,
+              details: split.details,
+              actions: autoActions,
               triggerId: trigger.id,
               triggerName: trigger.name,
               notifyDesktop: true,
@@ -2065,6 +2449,7 @@ export class ProactiveEngine {
   private attachLifecycleHooks(server: PluginServerContext): void {
     const rmTurnBefore = server.addHook("agent.turn.before", async ({ agent }, { paseo }) => {
       this.attachPaseo(paseo);
+      this.reportedTurnAgents.delete(agent.id);
       if (agent.background) return;
       const worker = this.store
         .get()
@@ -2084,6 +2469,8 @@ export class ProactiveEngine {
       "agent.turn.after",
       async ({ agent, turnId, outcome }, { paseo }) => {
         this.attachPaseo(paseo);
+        const alreadyReportedViaTool = this.reportedTurnAgents.has(agent.id);
+        this.reportedTurnAgents.delete(agent.id);
         if (agent.background) return;
 
         const worker = this.store
@@ -2104,51 +2491,69 @@ export class ProactiveEngine {
           // Ignore timeline read error
         }
 
-        const nextStatus =
-          outcome.kind === "completed"
-            ? "completed"
-            : outcome.kind === "failed"
-              ? "failed"
-              : worker.status;
+        const nextStatus: DelegatedWorker["status"] =
+          outcome.kind === "failed" ? "failed" : "completed";
 
-        const summary =
+        const split =
           outcome.kind === "failed"
-            ? `执行出错：${outcome.error.message}`
-            : latestReply.slice(0, 1200) || "子 Agent 回合已完成。";
+            ? { summary: `执行出错：${outcome.error.message}` }
+            : splitReplyIntoPreviewAndDetails(latestReply || "处理完成。");
 
+        const cleanTitle = cleanTaskTitle(worker.title);
         let chiefId: string | null = null;
-        await this.pushFeed({
-          level: outcome.kind === "failed" ? "error" : "worker_update",
-          title:
-            outcome.kind === "failed"
-              ? `子任务出错：${worker.title}`
-              : `子任务已完成：${worker.title}`,
-          summary,
-          agentId: worker.agentId,
-          workspaceId: worker.workspaceId,
-          notifyDesktop: true,
-          appendChiefTimeline: true,
-          beforeMutate: (draft) => {
+
+        if (alreadyReportedViaTool && outcome.kind !== "failed") {
+          // Tool already published a rich outcome card; only finalize worker status
+          await this.store.mutate((draft) => {
             const found = draft.workers.find((w) => w.id === worker.id);
             if (found) {
               found.status = nextStatus;
               found.updatedAt = new Date().toISOString();
-              found.summary = summary;
+              found.summary = split.summary;
             }
             chiefId = draft.chiefAgentId;
-          },
-        });
+          });
+          await this.broadcastSnapshot();
+        } else {
+          const autoActions =
+            outcome.kind === "completed"
+              ? extractSuggestedActionsFromMarkdown(latestReply)
+              : [];
+          await this.upsertAgentFeedCard({
+            agentId: worker.agentId,
+            workspaceId: worker.workspaceId,
+            level: outcome.kind === "failed" ? "error" : "worker_update",
+            title:
+              outcome.kind === "failed"
+                ? `执行出错：${cleanTitle}`
+                : `已完成：${cleanTitle}`,
+            summary: split.summary,
+            details: split.details,
+            actions: autoActions,
+            notifyDesktop: true,
+            appendChiefTimeline: true,
+            beforeMutate: (draft) => {
+              const found = draft.workers.find((w) => w.id === worker.id);
+              if (found) {
+                found.status = nextStatus;
+                found.updatedAt = new Date().toISOString();
+                found.summary = split.summary;
+              }
+              chiefId = draft.chiefAgentId;
+            },
+          });
+        }
 
         if (worker.notifyChiefOnFinish && chiefId && chiefId !== agent.id) {
           try {
             await paseo.agents.ref(chiefId).send(
               [
                 `[Delegated Worker Update]`,
-                `Worker: ${worker.title} (${worker.agentId})`,
+                `Worker: ${cleanTitle} (${worker.agentId})`,
                 `Workspace: ${worker.cwd}`,
                 `Status: ${nextStatus}`,
                 `Result Summary:`,
-                summary,
+                (split.details || split.summary).slice(0, 4000),
                 ``,
                 `Review whether the user's goal is now satisfied or if another step is needed.`,
               ].join("\n"),

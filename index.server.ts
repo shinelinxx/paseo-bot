@@ -8,6 +8,8 @@ import {
   executeFeedActionRpc,
   getBotSnapshotRpc,
   installPresetRpc,
+  manageNativeScheduleRpc,
+  manageWorkerRpc,
   markFeedReadRpc,
   resolveApprovalRpc,
   runTriggerNowRpc,
@@ -127,6 +129,18 @@ export default function contribute(server: PluginServerContext) {
     engine.attachPaseo(paseo);
     await ready;
     return engine.dismissSuggestion(suggestionId);
+  });
+
+  server.handle(manageWorkerRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.manageWorker(input);
+  });
+
+  server.handle(manageNativeScheduleRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.manageNativeSchedule(input);
   });
 
   server.handle(markFeedReadRpc, async ({ id, clearSilent }, { paseo }) => {

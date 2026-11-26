@@ -292,10 +292,9 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
         ) : null}
       </View>
 
-      <Markdown>{data.summary}</Markdown>
-
-      {data.details ? (
+      {data.details && data.details.startsWith(data.summary.slice(0, 48)) ? (
         <View style={{ gap: 6 }}>
+          <Markdown>{detailsOpen ? data.details : data.summary}</Markdown>
           <Pressable
             accessibilityRole="button"
             onPress={() => setDetailsOpen((v) => !v)}
@@ -304,27 +303,49 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
             <Icon
               name={detailsOpen ? "ChevronUp" : "ChevronDown"}
               size={13}
-              color={theme.colors.foregroundMuted}
+              color={theme.colors.accent}
             />
-            <Text style={[baseStyles.mutedSmall, { color: theme.colors.foregroundMuted }]}>
-              {detailsOpen ? t("layer2Hide") : t("layer2Show")}
+            <Text style={[baseStyles.mutedSmall, { color: theme.colors.accent, fontWeight: "600" }]}>
+              {detailsOpen ? t("fullReportHide") : t("fullReportShow")}
             </Text>
           </Pressable>
-          {detailsOpen ? (
-            <View
-              style={[
-                baseStyles.layer2Box,
-                {
-                  borderColor: theme.colors.border,
-                  backgroundColor: theme.colors.surface2,
-                },
-              ]}
-            >
-              <Markdown>{data.details}</Markdown>
+        </View>
+      ) : (
+        <>
+          <Markdown>{data.summary}</Markdown>
+          {data.details ? (
+            <View style={{ gap: 6 }}>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setDetailsOpen((v) => !v)}
+                style={baseStyles.titleGroup}
+              >
+                <Icon
+                  name={detailsOpen ? "ChevronUp" : "ChevronDown"}
+                  size={13}
+                  color={theme.colors.foregroundMuted}
+                />
+                <Text style={[baseStyles.mutedSmall, { color: theme.colors.foregroundMuted }]}>
+                  {detailsOpen ? t("layer2Hide") : t("layer2Show")}
+                </Text>
+              </Pressable>
+              {detailsOpen ? (
+                <View
+                  style={[
+                    baseStyles.layer2Box,
+                    {
+                      borderColor: theme.colors.border,
+                      backgroundColor: theme.colors.surface2,
+                    },
+                  ]}
+                >
+                  <Markdown>{data.details}</Markdown>
+                </View>
+              ) : null}
             </View>
           ) : null}
-        </View>
-      ) : null}
+        </>
+      )}
 
       <View style={baseStyles.chipRow}>
         {actions.map((act) => {

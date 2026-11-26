@@ -22,6 +22,8 @@ import {
   ensureChiefBotRpc,
   executeFeedActionRpc,
   installPresetRpc,
+  manageNativeScheduleRpc,
+  manageWorkerRpc,
   markFeedReadRpc,
   resolveApprovalRpc,
   runTriggerNowRpc,
@@ -37,6 +39,7 @@ import {
   type FeedItem,
   type GovernanceLevel,
   type MissionDraft,
+  type NativeScheduleItem,
   type PresetId,
   type RoutineSuggestion,
   type TriggerKind,
@@ -317,6 +320,29 @@ function isSameLocalDay(iso: string, refDate: Date): boolean {
   );
 }
 
+function formatNativeCadence(raw: string): string {
+  // e.g. "cron:30 8 * * * (Asia/Shanghai)" or "cron:0 */6 * * * (Asia/Shanghai)"
+  const cronMatch = /^cron:([^\s]+)\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)(?:\s*\(([^)]+)\))?/.exec(
+    raw.trim(),
+  );
+  if (!cronMatch) return raw;
+  const [, min, hour, dom, mon, dow] = cronMatch;
+  if (dom === "*" && mon === "*" && dow === "*") {
+    if (/^\d+$/.test(min) && /^\*\/(\d+)$/.test(hour)) {
+      const step = hour.slice(2);
+      return min === "0" ? `每 ${step} 小时` : `每 ${step} 小时（:${min.padStart(2, "0")}）`;
+    }
+    if (/^\d+$/.test(min) && /^\d+(?:,\d+)*$/.test(hour)) {
+      const times = hour
+        .split(",")
+        .map((h) => `${h.padStart(2, "0")}:${min.padStart(2, "0")}`)
+        .join("、");
+      return `每天 ${times}`;
+    }
+  }
+  return raw.replace(/^cron:/, "Cron ");
+}
+
 type PluginTheme = PluginScreenProps["theme"];
 
 function useBotTranslation() {
@@ -402,6 +428,7 @@ const WishHeroBar = memo(function WishHeroBar({
   webhookBaseUrl,
   t,
   onOpenAgent,
+  onTaskQueued,
   onJumpApprovals,
   onCopyText,
 }: {
@@ -417,6 +444,7 @@ const WishHeroBar = memo(function WishHeroBar({
   webhookBaseUrl: string | null;
   t: TranslateFn;
   onOpenAgent: (agentId: string) => void;
+  onTaskQueued: () => void;
   onJumpApprovals: () => void;
   onCopyText: (value: string) => void;
 }) {
@@ -436,17 +464,17 @@ const WishHeroBar = memo(function WishHeroBar({
       if (!trimmed || submittingWish) return;
       setSubmittingWish(true);
       try {
-        const res = await submitWish({ wish: trimmed });
+        await submitWish({ wish: trimmed });
         setWishText("");
         toast.show(t("wishSentToast"), { variant: "success" });
-        onOpenAgent(res.agentId);
+        onTaskQueued();
       } catch (err) {
         toast.error(err instanceof Error ? err.message : String(err));
       } finally {
         setSubmittingWish(false);
       }
     },
-    [onOpenAgent, submitWish, submittingWish, t, toast],
+    [onTaskQueued, submitWish, submittingWish, t, toast],
   );
 
   const handleSendWish = useCallback(async () => {
@@ -908,16 +936,13 @@ const FeedItemCard = memo(function FeedItemCard({
       try {
         const res = await runAction({ feedId: item.id, actionId: act.id });
         toast.show(res.message, { variant: res.ok ? "success" : "warning" });
-        if (res.agentId && act.kind === "wish") {
-          onOpenAgent(res.agentId);
-        }
       } catch (err) {
         toast.error(err instanceof Error ? err.message : String(err));
       } finally {
         setBusyKey(null);
       }
     },
-    [busyKey, item.id, onOpenAgent, runAction, toast],
+    [busyKey, item.id, runAction, toast],
   );
 
   const handleSnooze = useCallback(async () => {
@@ -950,15 +975,12 @@ const FeedItemCard = memo(function FeedItemCard({
       setReplyText("");
       setReplyOpen(false);
       toast.show(res.message, { variant: "success" });
-      if (res.agentId) {
-        onOpenAgent(res.agentId);
-      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyKey(null);
     }
-  }, [busyKey, item.id, onOpenAgent, replyText, runAction, toast]);
+  }, [busyKey, item.id, replyText, runAction, toast]);
 
   const handleTasteUp = useCallback(async () => {
     if (busyKey) return;
@@ -1021,6 +1043,13 @@ const FeedItemCard = memo(function FeedItemCard({
           </Text>
         </View>
         <View style={styles.rowCenterGap8}>
+          {item.inProgress ? (
+            <View style={[styles.pillBadge, { backgroundColor: theme.colors.surface2 }]}>
+              <Text style={[styles.text11Bold, { color: theme.colors.accent }]}>
+                {t("inProgressBadge")}
+              </Text>
+            </View>
+          ) : null}
           {item.triggerName ? (
             <View style={[styles.pillBadge, { backgroundColor: theme.colors.surface2 }]}>
               <Text style={[styles.text11, { color: theme.colors.foregroundMuted }]}>
@@ -1034,11 +1063,9 @@ const FeedItemCard = memo(function FeedItemCard({
         </View>
       </View>
 
-      <Markdown>{item.summary}</Markdown>
-
-      {/* Meta Muse Layer-2 Reasoning / Evidence Disclosure */}
-      {item.details ? (
+      {item.details && item.details.startsWith(item.summary.slice(0, 48)) ? (
         <View style={styles.colGap6}>
+          <Markdown>{detailsOpen ? item.details : item.summary}</Markdown>
           <Pressable
             accessibilityRole="button"
             onPress={() => setDetailsOpen((v) => !v)}
@@ -1047,27 +1074,49 @@ const FeedItemCard = memo(function FeedItemCard({
             <Icon
               name={detailsOpen ? "ChevronUp" : "ChevronDown"}
               size={13}
-              color={theme.colors.foregroundMuted}
+              color={theme.colors.accent}
             />
-            <Text style={[styles.text11, { color: theme.colors.foregroundMuted }]}>
-              {detailsOpen ? t("layer2Hide") : t("layer2Show")}
+            <Text style={[styles.text11Bold, { color: theme.colors.accent }]}>
+              {detailsOpen ? t("fullReportHide") : t("fullReportShow")}
             </Text>
           </Pressable>
-          {detailsOpen ? (
-            <View
-              style={[
-                styles.insetBox,
-                {
-                  borderColor: theme.colors.border,
-                  backgroundColor: theme.colors.surface2,
-                },
-              ]}
-            >
-              <Markdown>{item.details}</Markdown>
+        </View>
+      ) : (
+        <>
+          <Markdown>{item.summary}</Markdown>
+          {item.details ? (
+            <View style={styles.colGap6}>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setDetailsOpen((v) => !v)}
+                style={styles.rowCenterGap6}
+              >
+                <Icon
+                  name={detailsOpen ? "ChevronUp" : "ChevronDown"}
+                  size={13}
+                  color={theme.colors.foregroundMuted}
+                />
+                <Text style={[styles.text11, { color: theme.colors.foregroundMuted }]}>
+                  {detailsOpen ? t("layer2Hide") : t("layer2Show")}
+                </Text>
+              </Pressable>
+              {detailsOpen ? (
+                <View
+                  style={[
+                    styles.insetBox,
+                    {
+                      borderColor: theme.colors.border,
+                      backgroundColor: theme.colors.surface2,
+                    },
+                  ]}
+                >
+                  <Markdown>{item.details}</Markdown>
+                </View>
+              ) : null}
             </View>
           ) : null}
-        </View>
-      ) : null}
+        </>
+      )}
 
       {/* Poke Rich Micro-Actions + ChatGPT Pulse Taste Curation */}
       {showInteractiveBar ? (
@@ -1857,19 +1906,114 @@ const MissionCard = memo(function MissionCard({
   );
 });
 
+const NativeScheduleCard = memo(function NativeScheduleCard({
+  sched,
+  theme,
+  t,
+  onManage,
+}: {
+  sched: NativeScheduleItem;
+  theme: PluginTheme;
+  t: TranslateFn;
+  onManage: (id: string, action: "run_once" | "pause" | "resume") => void;
+}) {
+  const isActive = sched.status === "active";
+  const modelLabel = sched.target.replace(/^new-agent:/, "");
+
+  return (
+    <View
+      style={[
+        styles.card14,
+        {
+          borderColor: theme.colors.border,
+          backgroundColor: theme.colors.surface1,
+          opacity: isActive ? 1 : 0.68,
+        },
+      ]}
+    >
+      <View style={styles.rowCenterBetween}>
+        <View style={styles.flex1Gap2}>
+          <Text style={[styles.title15, { color: theme.colors.foreground }]}>
+            {sched.name}
+          </Text>
+          <Text style={[styles.text12, { color: theme.colors.foregroundMuted }]}>
+            {formatNativeCadence(sched.cadence)}
+            {modelLabel ? `  ·  ${modelLabel}` : ""}
+          </Text>
+        </View>
+        <View style={[styles.pillBadgePad3, { backgroundColor: theme.colors.surface2 }]}>
+          <Text
+            style={[
+              styles.text11Bold,
+              {
+                color: isActive
+                  ? theme.colors.statusSuccess
+                  : theme.colors.foregroundMuted,
+              },
+            ]}
+          >
+            {isActive ? t("statusActive") : t("statusPaused")}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.rowWrapGap8}>
+        {sched.nextRunAt ? (
+          <Text style={[styles.text11, { color: theme.colors.foregroundMuted }]}>
+            {t("nextRunLabel", { time: formatShortTime(sched.nextRunAt) })}
+          </Text>
+        ) : null}
+        {sched.lastRunAt ? (
+          <Text style={[styles.text11, { color: theme.colors.foregroundMuted }]}>
+            {t("lastRunLabel", { time: formatShortTime(sched.lastRunAt) })}
+          </Text>
+        ) : null}
+      </View>
+
+      <View style={[styles.rowWrapGap8, { marginTop: 2 }]}>
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => onManage(sched.id, "run_once")}
+          style={[styles.smallIconBtn, { backgroundColor: theme.colors.surface2 }]}
+        >
+          <Icon name="Play" size={13} color={theme.colors.foreground} />
+          <Text style={[styles.text12, { color: theme.colors.foreground }]}>
+            {t("runNow")}
+          </Text>
+        </Pressable>
+
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => onManage(sched.id, isActive ? "pause" : "resume")}
+          style={[styles.smallBtnPad6, { backgroundColor: theme.colors.surface2 }]}
+        >
+          <Text style={[styles.text12, { color: theme.colors.foreground }]}>
+            {isActive ? t("pause") : t("enable")}
+          </Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+});
+
 const WorkerCard = memo(function WorkerCard({
   wrk,
   theme,
   t,
   openAgentLabel,
   onOpenAgent,
+  onStopWorker,
+  onRemoveWorker,
 }: {
   wrk: DelegatedWorker;
   theme: PluginTheme;
   t: TranslateFn;
   openAgentLabel: string;
   onOpenAgent: (agentId: string) => void;
+  onStopWorker: (id: string) => void;
+  onRemoveWorker: (id: string) => void;
 }) {
+  const isRunning = wrk.status === "running" || wrk.status === "permission";
   const statusTone =
     wrk.status === "completed"
       ? theme.colors.statusSuccess
@@ -1905,7 +2049,7 @@ const WorkerCard = memo(function WorkerCard({
           {wrk.summary}
         </Text>
       ) : null}
-      <View style={{ flexDirection: "row" }}>
+      <View style={styles.rowWrapGap8}>
         <Pressable
           accessibilityRole="button"
           onPress={() => onOpenAgent(wrk.agentId)}
@@ -1918,6 +2062,34 @@ const WorkerCard = memo(function WorkerCard({
             {openAgentLabel}
           </Text>
         </Pressable>
+
+        {isRunning ? (
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => onStopWorker(wrk.id)}
+            style={[
+              styles.smallBtnPad6,
+              { paddingHorizontal: 12, backgroundColor: theme.colors.surface2 },
+            ]}
+          >
+            <Text style={[styles.text12, { color: theme.colors.statusWarning }]}>
+              {t("stopWorker")}
+            </Text>
+          </Pressable>
+        ) : (
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => onRemoveWorker(wrk.id)}
+            style={[
+              styles.smallBtnPad6,
+              { paddingHorizontal: 12, backgroundColor: theme.colors.surface2 },
+            ]}
+          >
+            <Text style={[styles.text12, { color: theme.colors.foregroundMuted }]}>
+              {t("removeWorker")}
+            </Text>
+          </Pressable>
+        )}
       </View>
     </View>
   );
@@ -2526,6 +2698,8 @@ export function BotConsoleScreen({
   const resolveApproval = useRpc(resolveApprovalRpc);
   const markFeedRead = useRpc(markFeedReadRpc);
   const dismissSuggestion = useRpc(dismissSuggestionRpc);
+  const manageWorker = useRpc(manageWorkerRpc);
+  const manageNativeSchedule = useRpc(manageNativeScheduleRpc);
 
   const [activeTab, setActiveTab] = useState<BotConsoleTab>("inbox");
   const [showSilent, setShowSilent] = useState(false);
@@ -2717,6 +2891,57 @@ export function BotConsoleScreen({
     setActiveTab("approvals");
   }, []);
 
+  const handleTaskQueued = useCallback(() => {
+    setActiveTab("inbox");
+  }, []);
+
+  const handleManageNativeSchedule = useCallback(
+    (id: string, action: "run_once" | "pause" | "resume") => {
+      void manageNativeSchedule({ id, action })
+        .then((res) => {
+          toast.show(res.message, { variant: res.ok ? "success" : "warning" });
+        })
+        .catch((err) => {
+          toast.error(err instanceof Error ? err.message : String(err));
+        });
+    },
+    [manageNativeSchedule, toast],
+  );
+
+  const handleStopWorker = useCallback(
+    (workerId: string) => {
+      void manageWorker({ action: "stop", workerId })
+        .then((res) => {
+          if (res.ok) toast.show(t("workerStoppedToast"), { variant: "info" });
+        })
+        .catch((err) => {
+          toast.error(err instanceof Error ? err.message : String(err));
+        });
+    },
+    [manageWorker, t, toast],
+  );
+
+  const handleRemoveWorker = useCallback(
+    (workerId: string) => {
+      void manageWorker({ action: "remove", workerId });
+    },
+    [manageWorker],
+  );
+
+  const handleClearFinishedWorkers = useCallback(() => {
+    void manageWorker({ action: "clear_finished" })
+      .then((res) => {
+        if (res.ok) {
+          toast.show(t("workersClearedToast", { count: res.removedCount ?? 0 }), {
+            variant: "info",
+          });
+        }
+      })
+      .catch((err) => {
+        toast.error(err instanceof Error ? err.message : String(err));
+      });
+  }, [manageWorker, t, toast]);
+
   const { todayFeed, earlierFeed } = useMemo(() => {
     const filtered = showSilent
       ? snap.feed
@@ -2749,11 +2974,22 @@ export function BotConsoleScreen({
     return map;
   }, [snap.triggers]);
 
+  const nativeSchedules = snap.nativeSchedules ?? [];
+
   const activeMissionCount = useMemo(() => {
     let count = 0;
     for (const m of snap.triggers) if (m.enabled) count += 1;
+    for (const s of nativeSchedules) if (s.status === "active") count += 1;
     return count;
-  }, [snap.triggers]);
+  }, [nativeSchedules, snap.triggers]);
+
+  const hasFinishedWorkers = useMemo(
+    () =>
+      snap.workers.some(
+        (w) => w.status !== "running" && w.status !== "permission",
+      ),
+    [snap.workers],
+  );
 
   const pad = layout.compact ? 14 : 22;
   const openAgentLabel = t("openAgent");
@@ -2820,6 +3056,7 @@ export function BotConsoleScreen({
           webhookBaseUrl={snap.webhookBaseUrl}
           t={t}
           onOpenAgent={openAgentSession}
+          onTaskQueued={handleTaskQueued}
           onJumpApprovals={handleJumpApprovals}
           onCopyText={handleCopyText}
         />
@@ -3116,7 +3353,30 @@ export function BotConsoleScreen({
               ))}
             </View>
 
-            {snap.triggers.length === 0 ? (
+            {nativeSchedules.length > 0 ? (
+              <View style={styles.colGap10}>
+                <Text style={[styles.sectionHeader, { color: theme.colors.foregroundMuted }]}>
+                  {t("nativeSchedulesTitle", { count: nativeSchedules.length })}
+                </Text>
+                {nativeSchedules.map((sched) => (
+                  <NativeScheduleCard
+                    key={sched.id}
+                    sched={sched}
+                    theme={theme}
+                    t={t}
+                    onManage={handleManageNativeSchedule}
+                  />
+                ))}
+              </View>
+            ) : null}
+
+            {snap.triggers.length > 0 && nativeSchedules.length > 0 ? (
+              <Text style={[styles.sectionHeader, { color: theme.colors.foregroundMuted }]}>
+                {t("pluginRulesTitle", { count: snap.triggers.length })}
+              </Text>
+            ) : null}
+
+            {snap.triggers.length === 0 && nativeSchedules.length === 0 ? (
               <View
                 style={[
                   styles.emptyBox,
@@ -3153,6 +3413,27 @@ export function BotConsoleScreen({
         {activeTab === "workers" ? (
           <View style={styles.colGap16}>
             <View style={styles.colGap10}>
+              {hasFinishedWorkers ? (
+                <View style={styles.rowCenterBetween}>
+                  <View />
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={handleClearFinishedWorkers}
+                    style={[
+                      styles.smallBorderBtn,
+                      {
+                        backgroundColor: theme.colors.surface1,
+                        borderColor: theme.colors.border,
+                      },
+                    ]}
+                  >
+                    <Text style={[styles.text12, { color: theme.colors.foregroundMuted }]}>
+                      {t("clearFinishedWorkers")}
+                    </Text>
+                  </Pressable>
+                </View>
+              ) : null}
+
               {snap.workers.length === 0 ? (
                 <View
                   style={[
@@ -3176,6 +3457,8 @@ export function BotConsoleScreen({
                     t={t}
                     openAgentLabel={openAgentLabel}
                     onOpenAgent={openAgentSession}
+                    onStopWorker={handleStopWorker}
+                    onRemoveWorker={handleRemoveWorker}
                   />
                 ))
               )}

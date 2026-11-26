@@ -114,6 +114,7 @@ export const FeedItemSchema = z.object({
   summary: z.string(),
   details: z.string().optional(),
   actions: z.array(FeedActionSchema).default([]),
+  inProgress: z.boolean().default(false),
   feedback: FeedFeedbackSchema.optional(),
   feedbackNote: z.string().optional(),
   snoozedUntil: z.string().optional(),
@@ -193,6 +194,17 @@ export const RoutineSuggestionSchema = z.object({
 });
 export type RoutineSuggestion = z.output<typeof RoutineSuggestionSchema>;
 
+export const NativeScheduleSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  cadence: z.string(),
+  target: z.string(),
+  status: z.string(),
+  nextRunAt: z.string().nullable().optional(),
+  lastRunAt: z.string().nullable().optional(),
+});
+export type NativeScheduleItem = z.output<typeof NativeScheduleSchema>;
+
 export const BotSnapshotSchema = z.object({
   chiefAgentId: z.string().nullable(),
   chiefWorkspaceId: z.string().nullable(),
@@ -205,6 +217,7 @@ export const BotSnapshotSchema = z.object({
   runningWorkerCount: z.number().int().nonnegative(),
   totalSilentChecks: z.number().int().nonnegative().default(0),
   triggers: z.array(TriggerSpecSchema),
+  nativeSchedules: z.array(NativeScheduleSchema).default([]),
   feed: z.array(FeedItemSchema),
   approvals: z.array(ApprovalItemSchema),
   workers: z.array(DelegatedWorkerSchema),
@@ -425,6 +438,30 @@ export const dismissSuggestionRpc = defineRpc({
     suggestionId: z.string().min(1),
   }),
   output: z.object({ ok: z.boolean() }),
+});
+
+export const manageWorkerRpc = defineRpc({
+  name: "bot.worker.manage",
+  input: z.object({
+    action: z.enum(["stop", "remove", "clear_finished"]),
+    workerId: z.string().optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    removedCount: z.number().int().nonnegative().optional(),
+  }),
+});
+
+export const manageNativeScheduleRpc = defineRpc({
+  name: "bot.native_schedule.manage",
+  input: z.object({
+    id: z.string().min(1),
+    action: z.enum(["run_once", "pause", "resume"]),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    message: z.string(),
+  }),
 });
 
 export const saveMemoryRpc = defineRpc({

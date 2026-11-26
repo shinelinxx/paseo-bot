@@ -117,6 +117,7 @@ function normalizeFeedItem(raw: FeedItem): FeedItem {
   return {
     ...raw,
     actions: Array.isArray(raw.actions) ? raw.actions : [],
+    inProgress: typeof raw.inProgress === "boolean" ? raw.inProgress : false,
   };
 }
 

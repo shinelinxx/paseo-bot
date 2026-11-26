@@ -2,7 +2,7 @@
   "name": "paseo-bot",
   "private": true,
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Proactive background automation plugin for Paseo with natural-language rules, zero-token diff checks, actionable update cards, staged confirmations, and cross-workspace subtasks.",
   "license": "MIT",
   "repository": {

@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import type {
   ApprovalItem,
+  FeedAction,
   FeedFeedback,
   FeedItem,
   GovernanceLevel,
@@ -9,7 +10,7 @@ import type {
   RoutineSuggestion,
   TriggerKind,
 } from "../shared/contracts";
-import { expandHomePath, type PersistedBotState } from "./storage.ts";
+import { createShortId, expandHomePath, type PersistedBotState } from "./storage.ts";
 
 const CHINESE_NUMERALS: Record<string, number> = {
   零: 0,
@@ -437,4 +438,104 @@ export function applyApprovalResolutionMutation(
   }
 
   return { target, promotedTriggerName };
+}
+
+export function cleanTaskTitle(raw: string): string {
+  return raw
+    .replace(/^(?:子任务已完成|子任务出错|已开始处理|已完成|任务|许愿|Bot Worker)\s*[：:·]\s*/gu, "")
+    .replace(/^(?:任务|许愿|Bot Worker)\s*[：:·]\s*/gu, "")
+    .trim();
+}
+
+export function splitReplyIntoPreviewAndDetails(
+  rawText: string,
+  maxPreviewChars = 360,
+  maxPreviewLines = 6,
+): { summary: string; details?: string } {
+  const full = rawText.trim().slice(0, 12_000);
+  if (!full) {
+    return { summary: "处理完成。" };
+  }
+
+  const allLines = full.split("\n");
+  const nonEmptyCount = allLines.filter((l) => l.trim().length > 0).length;
+  if (full.length <= maxPreviewChars && nonEmptyCount <= maxPreviewLines) {
+    return { summary: full };
+  }
+
+  const previewLines: string[] = [];
+  let charTotal = 0;
+  let nonEmptyPicked = 0;
+  let inCodeFence = false;
+
+  for (const line of allLines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+    }
+    previewLines.push(line);
+    charTotal += line.length + 1;
+    if (trimmed.length > 0 && !/^---+$/.test(trimmed)) {
+      nonEmptyPicked += 1;
+    }
+    if (
+      !inCodeFence &&
+      (nonEmptyPicked >= maxPreviewLines || charTotal >= maxPreviewChars)
+    ) {
+      break;
+    }
+  }
+
+  const preview = previewLines.join("\n").trim();
+  if (!preview || preview.length >= full.length - 30) {
+    return { summary: full };
+  }
+  return {
+    summary: preview,
+    details: full,
+  };
+}
+
+export function extractSuggestedActionsFromMarkdown(markdown: string): FeedAction[] {
+  if (!markdown || markdown.length < 30) return [];
+  const actions: FeedAction[] = [];
+  const seenLabels = new Set<string>();
+
+  // Match numbered bold items like: 1. **确认是否给 voice-clean 增加...** or - **归档 00-Inbox 草稿**
+  const itemRegex = /(?:^|\n)\s*(?:\d+\.|[-*])\s+\*\*([^*]{4,64})\*\*/g;
+  let match: RegExpExecArray | null;
+  while ((match = itemRegex.exec(markdown)) !== null) {
+    const rawHeadline = match[1]
+      .replace(/`+/g, "")
+      .replace(/（[^）]*）/g, "")
+      .replace(/\([^)]*\)/g, "")
+      .trim();
+    if (!rawHeadline) continue;
+    // Skip items that explicitly require human CAPTCHA / manual browser login
+    if (/(人机验证|CAPTCHA|扫码登录|手动登录)/i.test(rawHeadline)) continue;
+
+    // Prefer actionable items containing decision/action verbs
+    if (
+      !/(确认|核对|归档|整理|修复|更新|同步|删除|清理|增加|添加|开启|关闭|检查|处理|发送|生成|升级)/u.test(
+        rawHeadline,
+      )
+    ) {
+      continue;
+    }
+
+    const shortLabel =
+      rawHeadline.length > 18 ? `${rawHeadline.slice(0, 17)}…` : rawHeadline;
+    if (seenLabels.has(shortLabel)) continue;
+    seenLabels.add(shortLabel);
+
+    actions.push({
+      id: createShortId("act"),
+      label: shortLabel,
+      kind: "wish",
+      prompt: `请直接跟进并处理这项待办：「${match[1].trim()}」`,
+    });
+    if (actions.length >= 3) break;
+  }
+
+  return actions;
 }

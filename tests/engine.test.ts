@@ -6,10 +6,13 @@ import test from "node:test";
 import {
   applyApprovalResolutionMutation,
   applyFeedCurationMutation,
+  cleanTaskTitle,
   computeRoutineSuggestions,
   draftMissionFromIntent,
   extractDailyTime,
   extractIntervalSec,
+  extractSuggestedActionsFromMarkdown,
+  splitReplyIntoPreviewAndDetails,
 } from "../server/intent.ts";
 import {
   BotStateStore,
@@ -191,6 +194,7 @@ test("Feed filter feedback and approval auto-run promotion update persisted stat
         title: "小额订阅扣款 $4.99",
         summary: "iCloud 扣费 $4.99",
         actions: [],
+        inProgress: false,
         triggerId: "trg_1",
         triggerName: "账单检查",
         unread: true,
@@ -238,4 +242,47 @@ test("Feed filter feedback and approval auto-run promotion update persisted stat
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("splitReplyIntoPreviewAndDetails preserves full long reports while extracting clean preview", () => {
+  const short = "一切正常，共检查 3 个目录，无待办。";
+  const shortRes = splitReplyIntoPreviewAndDetails(short);
+  assert.equal(shortRes.summary, short);
+  assert.equal(shortRes.details, undefined);
+
+  const longReport = [
+    "### 今日总览",
+    "1. 第一项重点结论说明",
+    "2. 第二项重点结论说明",
+    "3. 第三项重点结论说明",
+    "4. 第四项重点结论说明",
+    "5. 第五项重点结论说明",
+    "6. 第六项重点结论说明",
+    ...Array.from({ length: 40 }, (_, i) => `- 详细附录条目 #${i + 1}：完整保留不被 1200 字截断`),
+  ].join("\n");
+
+  const longRes = splitReplyIntoPreviewAndDetails(longReport);
+  assert.ok(longRes.details);
+  assert.equal(longRes.details, longReport);
+  assert.ok(longRes.summary.length < longReport.length);
+  assert.ok(longRes.details.startsWith(longRes.summary));
+});
+
+test("cleanTaskTitle strips redundant nested prefixes and extractSuggestedActionsFromMarkdown builds buttons", () => {
+  assert.equal(
+    cleanTaskTitle("子任务已完成：任务 · 检查当前所有工作区进度"),
+    "检查当前所有工作区进度",
+  );
+
+  const report = [
+    "### 待处理事项",
+    "1. **完成 Google 人机验证（需手动点击）**",
+    "2. **核对今日 4 笔限购订单记录**",
+    "3. **确认是否给 `voice-clean` 增加实时语音自动切快模型功能**",
+  ].join("\n");
+
+  const actions = extractSuggestedActionsFromMarkdown(report);
+  assert.equal(actions.length, 2);
+  assert.match(actions[0].label, /核对今日 4 笔限购订单记录/);
+  assert.match(actions[1].prompt ?? "", /voice-clean/);
 });

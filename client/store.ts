@@ -15,6 +15,7 @@ const EMPTY_SNAPSHOT: BotSnapshot = {
   runningWorkerCount: 0,
   totalSilentChecks: 0,
   triggers: [],
+  nativeSchedules: [],
   feed: [],
   approvals: [],
   workers: [],
@@ -127,6 +128,10 @@ function emit(): void {
 export function setLiveBotSnapshot(next: BotSnapshot): void {
   const prev = currentSnapshot;
   const triggers = reconcileById(prev.triggers, next.triggers);
+  const nativeSchedules = reconcileById(
+    prev.nativeSchedules ?? [],
+    next.nativeSchedules ?? [],
+  );
   const feed = reconcileById(prev.feed, next.feed);
   const approvals = reconcileById(prev.approvals, next.approvals);
   const workers = reconcileById(prev.workers, next.workers);
@@ -149,6 +154,7 @@ export function setLiveBotSnapshot(next: BotSnapshot): void {
     prev.memoryContent === next.memoryContent &&
     prev.memoryPath === next.memoryPath &&
     triggers === prev.triggers &&
+    nativeSchedules === prev.nativeSchedules &&
     feed === prev.feed &&
     approvals === prev.approvals &&
     workers === prev.workers &&
@@ -159,6 +165,7 @@ export function setLiveBotSnapshot(next: BotSnapshot): void {
   currentSnapshot = {
     ...next,
     triggers,
+    nativeSchedules,
     feed,
     approvals,
     workers,

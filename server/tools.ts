@@ -260,14 +260,15 @@ export function registerBotAgentTools(
         };
       }
 
-      await engine.pushFeed({
+      engine.markTurnReported(agent.id);
+      await engine.upsertAgentFeedCard({
+        agentId: agent.id,
+        workspaceId: agent.workspaceId ?? undefined,
         level,
         title: title || agent.title || "Paseo Bot 动态",
         summary,
         details,
         actions: normalizedActions,
-        agentId: agent.id,
-        workspaceId: agent.workspaceId ?? undefined,
         notifyDesktop: level === "notify",
         appendChiefTimeline: level === "notify",
       });

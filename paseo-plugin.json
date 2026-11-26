@@ -1,0 +1,15 @@
+{
+  "id": "paseo-bot",
+  "name": "Paseo Bot",
+  "description": "Proactive background automation for Paseo with natural-language rules, zero-token diff checks, actionable update cards, staged confirmations, and cross-workspace subtasks.",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.17.4"
+  },
+  "translations": {
+    "zh-CN": {
+      "name": "Paseo Bot",
+      "description": "Paseo 后台自动任务与主动提醒插件：支持一句话创建自动规则、无变化静默跳过、带快捷操作的动态卡片、敏感操作确认预览，以及跨目录子任务协同。"
+    }
+  }
+}

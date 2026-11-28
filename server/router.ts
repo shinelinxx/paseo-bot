@@ -492,6 +492,104 @@ export function resolveTierProviderChain(
   };
 }
 
+export function extractAgentModelPair(agent: unknown): string | undefined {
+  if (!agent || typeof agent !== "object") return undefined;
+  const rec = agent as Record<string, unknown>;
+  const runtime =
+    rec.runtimeInfo && typeof rec.runtimeInfo === "object"
+      ? (rec.runtimeInfo as Record<string, unknown>)
+      : undefined;
+  const prov =
+    (typeof rec.provider === "string" && rec.provider.trim()) ||
+    (typeof runtime?.provider === "string" && runtime.provider.trim()) ||
+    "";
+  const model =
+    (typeof rec.model === "string" && rec.model.trim()) ||
+    (typeof runtime?.model === "string" && runtime.model.trim()) ||
+    "";
+  if (prov && model) return `${prov}/${model}`;
+  return prov || model || undefined;
+}
+
+function extractAgentThinkingOptionId(agent: unknown): string | undefined {
+  if (!agent || typeof agent !== "object") return undefined;
+  const rec = agent as Record<string, unknown>;
+  const runtime =
+    rec.runtimeInfo && typeof rec.runtimeInfo === "object"
+      ? (rec.runtimeInfo as Record<string, unknown>)
+      : undefined;
+  const raw =
+    (typeof rec.thinkingOptionId === "string" && rec.thinkingOptionId.trim()) ||
+    (typeof rec.effectiveThinkingOptionId === "string" &&
+      rec.effectiveThinkingOptionId.trim()) ||
+    (typeof runtime?.thinkingOptionId === "string" && runtime.thinkingOptionId.trim()) ||
+    "";
+  return raw || undefined;
+}
+
+function normalizeComparableCwd(raw: string): string {
+  const clean = raw.trim().replace(/\\/g, "/");
+  return clean.length > 1 ? clean.replace(/\/+$/, "") : clean;
+}
+
+export interface ExpectedAgentConfigMatch {
+  providerModel: string;
+  allowedFallbackModel?: string;
+  thinkingOptionId?: string;
+  cwd?: string;
+}
+
+/**
+ * Verify whether an existing reusable session (e.g. warm L1 or shared Chief)
+ * still matches the latest configured provider/model, thinking level, and cwd.
+ */
+export function doesAgentMatchExpectedConfig(
+  agent: unknown,
+  expected: ExpectedAgentConfigMatch,
+): boolean {
+  const expectedPair = (expected.providerModel ?? "").trim();
+  if (!expectedPair) return true;
+
+  const actualPair = extractAgentModelPair(agent);
+  if (!actualPair) return false;
+
+  const matchesPair = (target: string): boolean => {
+    const cleanTarget = target.trim();
+    if (!cleanTarget) return false;
+    if (cleanTarget.includes("/")) {
+      return actualPair === cleanTarget;
+    }
+    const actualProv = actualPair.includes("/")
+      ? actualPair.split("/", 2)[0]
+      : actualPair;
+    return actualProv === cleanTarget;
+  };
+
+  const modelMatches =
+    matchesPair(expectedPair) ||
+    Boolean(expected.allowedFallbackModel && matchesPair(expected.allowedFallbackModel));
+  if (!modelMatches) return false;
+
+  const expectedThinking = expected.thinkingOptionId?.trim();
+  const actualThinking = extractAgentThinkingOptionId(agent);
+  if (expectedThinking && actualThinking && actualThinking !== expectedThinking) {
+    return false;
+  }
+
+  const expectedCwd = expected.cwd?.trim();
+  const rec = agent && typeof agent === "object" ? (agent as Record<string, unknown>) : undefined;
+  const actualCwd = typeof rec?.cwd === "string" ? rec.cwd.trim() : "";
+  if (
+    expectedCwd &&
+    actualCwd &&
+    normalizeComparableCwd(actualCwd) !== normalizeComparableCwd(expectedCwd)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 export function extractInlineLinksFromMarkdown(markdown: string): ChatInlineLink[] {
   if (!markdown) return [];
   const out: ChatInlineLink[] = [];

@@ -24,7 +24,9 @@ import {
   buildConclusionSummary,
   buildOnboardingMessages,
   classifyMessageTier,
+  doesAgentMatchExpectedConfig,
   evaluateWorkerTurnForStream,
+  extractAgentModelPair,
   parseProfilePreferenceFromMemoryNote,
   projectLegacyFeedToMessages,
   resolveTierProviderChain,
@@ -1670,6 +1672,278 @@ test("T-008A: stopped reload guard, reconcileOrphanThinkingAcks self-healing, L2
     }
 
     await engine2.stop();
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("Warm L1 & Chief session reuse validates latest provider/model/thinking config and auto-rebuilds on change", async () => {
+  // 1. Unit assertions for extractAgentModelPair & doesAgentMatchExpectedConfig
+  const flashAgent = {
+    provider: "antigravity",
+    model: "gemini-3.8-flash",
+    thinkingOptionId: "low",
+    cwd: "/Users/demo/KnowledgeBase/",
+  };
+  assert.equal(extractAgentModelPair(flashAgent), "antigravity/gemini-3.8-flash");
+  assert.equal(
+    doesAgentMatchExpectedConfig(flashAgent, {
+      providerModel: "antigravity/gemini-3.8-flash",
+      thinkingOptionId: "low",
+      cwd: "/Users/demo/KnowledgeBase",
+    }),
+    true,
+  );
+  // Model changed within same provider (e.g. gemini-3.8-flash -> gemini-4-neon) -> mismatch!
+  assert.equal(
+    doesAgentMatchExpectedConfig(flashAgent, {
+      providerModel: "antigravity/gemini-4-neon",
+      thinkingOptionId: "low",
+    }),
+    false,
+  );
+  // Provider changed -> mismatch!
+  assert.equal(
+    doesAgentMatchExpectedConfig(flashAgent, {
+      providerModel: "codex/gpt-5.4",
+    }),
+    false,
+  );
+  // Thinking level changed -> mismatch!
+  assert.equal(
+    doesAgentMatchExpectedConfig(flashAgent, {
+      providerModel: "antigravity/gemini-3.8-flash",
+      thinkingOptionId: "high",
+    }),
+    false,
+  );
+  // Home cwd changed -> mismatch!
+  assert.equal(
+    doesAgentMatchExpectedConfig(flashAgent, {
+      providerModel: "antigravity/gemini-3.8-flash",
+      cwd: "/Users/demo/OtherWorkspace",
+    }),
+    false,
+  );
+  // runtimeInfo fallback extraction works when top-level model is null
+  assert.equal(
+    extractAgentModelPair({
+      provider: "antigravity",
+      model: null,
+      runtimeInfo: { provider: "antigravity", model: "gemini-4-neon" },
+    }),
+    "antigravity/gemini-4-neon",
+  );
+
+  // 2. End-to-end engine test: switching fastProvider / fastThinking / chiefProvider takes effect on very next turn
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-l1-model-switch-"));
+  try {
+    const store = new BotStateStore(tmpDir);
+    const engine = new ProactiveEngine({ store });
+
+    let currentSettings = {
+      ...DEFAULT_BOT_SETTINGS,
+      homeCwd: tmpDir,
+      memoryFilePath: path.join(tmpDir, "MEMORY.md"),
+      desktopNotify: false,
+      webhookEnabled: false,
+    };
+    let settingsListener:
+      | ((next: { status: "ready"; values: typeof currentSettings }) => Promise<void> | void)
+      | null = null;
+
+    const fakeServer = {
+      addHook() {
+        return () => undefined;
+      },
+    } as unknown as PluginServerContext;
+
+    const fakeSettingsHandle = {
+      read: async () => ({ status: "ready" as const, values: currentSettings }),
+      subscribe: (
+        fn: (next: { status: "ready"; values: typeof currentSettings }) => Promise<void> | void,
+      ) => {
+        settingsListener = fn;
+        return () => {
+          settingsListener = null;
+        };
+      },
+    };
+
+    interface SpawnedRec {
+      id: string;
+      providerPair: string;
+      thinkingOptionId?: string;
+      role?: string;
+      archivedAt: string | null;
+      status: string;
+    }
+
+    const spawned = new Map<string, SpawnedRec>();
+    let seq = 0;
+
+    const makeHandle = (rec: SpawnedRec) => ({
+      id: rec.id,
+      workspaceId: "wks_home",
+      cwd: tmpDir,
+      refresh: async () => ({
+        agent: {
+          id: rec.id,
+          workspaceId: "wks_home",
+          cwd: tmpDir,
+          provider: rec.providerPair.split("/")[0],
+          model: rec.providerPair.split("/")[1],
+          thinkingOptionId: rec.thinkingOptionId ?? null,
+          status: rec.status,
+          archivedAt: rec.archivedAt,
+        },
+        project: null,
+      }),
+      run: async () => ({
+        status: "idle" as const,
+        lastMessage: `Replied via ${rec.providerPair}`,
+      }),
+      send: async () => undefined,
+      archive: async () => {
+        rec.archivedAt = new Date().toISOString();
+      },
+      timeline: {
+        refetch: async () => ({ entries: [] }),
+        append: async () => ({ seq: 1, epoch: "e1" }),
+      },
+    });
+
+    const mockPaseo = {
+      providers: {
+        snapshot: async () => ({
+          entries: [
+            {
+              provider: "antigravity",
+              label: "Antigravity",
+              enabled: true,
+              status: "ready",
+              models: [
+                { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+                { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen" },
+                { id: "gemini-4-carbon", label: "Gemini 4 Carbon", isDefault: true },
+                { id: "gemini-4-neon", label: "Gemini 4 Neon" },
+              ],
+              modes: [{ id: "auto" }],
+            },
+          ],
+        }),
+        listModes: async () => ({ modes: [{ id: "auto" }] }),
+      },
+      workspaces: {
+        list: async () => ({ entries: [] }),
+        open: async () => ({
+          id: "wks_home",
+          agents: {
+            create: async (opts: {
+              config: { provider: string; thinkingOptionId?: string };
+              labels?: Record<string, string>;
+            }) => {
+              seq += 1;
+              const rec: SpawnedRec = {
+                id: `agt_${seq}`,
+                providerPair: opts.config.provider,
+                thinkingOptionId: opts.config.thinkingOptionId,
+                role: opts.labels?.["paseo-bot/role"],
+                archivedAt: null,
+                status: "idle",
+              };
+              spawned.set(rec.id, rec);
+              return makeHandle(rec);
+            },
+          },
+        }),
+      },
+      agents: {
+        list: async () => ({ entries: [] }),
+        ref: (id: string) => {
+          const rec = spawned.get(id);
+          if (!rec) {
+            return {
+              id,
+              refresh: async () => null,
+              archive: async () => undefined,
+              timeline: { append: async () => ({ seq: 1, epoch: "e1" }) },
+            };
+          }
+          return makeHandle(rec);
+        },
+      },
+    } as unknown as PaseoApi;
+
+    await engine.start(fakeServer, fakeSettingsHandle as never);
+    engine.attachPaseo(mockPaseo);
+
+    // Turn 1: creates warm L1 with default gemini-3.8-flash
+    const turn1 = await engine.sendChatMessage({ text: "嗨" });
+    assert.equal(turn1.tier, "L1");
+    assert.equal(turn1.modelUsed, "antigravity/gemini-3.8-flash");
+    const firstL1Id = store.get().l1AgentId!;
+    assert.equal(firstL1Id, "agt_1");
+
+    // Turn 2: unchanged config reuses agt_1
+    const turn2 = await engine.sendChatMessage({ text: "早上好" });
+    assert.equal(turn2.agentId, "agt_1");
+    assert.equal(turn2.modelUsed, "antigravity/gemini-3.8-flash");
+
+    // Case A: Settings updated via live settingsHandle subscription (fastProvider -> gemini-4-neon)
+    currentSettings = {
+      ...currentSettings,
+      fastProvider: "antigravity/gemini-4-neon",
+    };
+    await settingsListener!({ status: "ready", values: currentSettings });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(store.get().l1AgentId, null);
+    assert.ok(spawned.get("agt_1")?.archivedAt, "Old L1 background session should be archived");
+
+    const turn3 = await engine.sendChatMessage({ text: "现在是什么模型？" });
+    assert.equal(turn3.tier, "L1");
+    assert.equal(turn3.modelUsed, "antigravity/gemini-4-neon");
+    assert.equal(turn3.agentId, "agt_2");
+    assert.equal(store.get().l1AgentId, "agt_2");
+    const msg3 = store.get().messages.find((m) => m.id === turn3.assistantMessageId)!;
+    assert.match(msg3.text, /antigravity\/gemini-4-neon/);
+
+    // Case B: Persisted state.l1AgentId ("agt_2", gemini-4-neon) mismatches in-memory settings (e.g. config.json edited before reload -> gemini-4-hydrogen)
+    (engine as unknown as { settings: typeof currentSettings }).settings = {
+      ...currentSettings,
+      fastProvider: "antigravity/gemini-4-hydrogen",
+    };
+    const turn4 = await engine.sendChatMessage({ text: "再测一次" });
+    assert.equal(turn4.tier, "L1");
+    assert.equal(turn4.modelUsed, "antigravity/gemini-4-hydrogen");
+    assert.equal(turn4.agentId, "agt_3");
+    assert.equal(store.get().l1AgentId, "agt_3");
+    assert.ok(spawned.get("agt_2")?.archivedAt, "Mismatched persisted L1 session should be archived");
+
+    // Subsequent turn with matching gemini-4-hydrogen reuses agt_3 without churning
+    const turn5 = await engine.sendChatMessage({ text: "继续保持" });
+    assert.equal(turn5.agentId, "agt_3");
+    assert.equal(turn5.modelUsed, "antigravity/gemini-4-hydrogen");
+
+    // Case C: Shared Chief session also rebuilds when chiefProvider changes
+    const chief1 = await engine.ensureChiefBot();
+    assert.equal(chief1.created, true);
+    assert.equal(chief1.modelUsed, "antigravity/gemini-4-carbon");
+    const chief1Reuse = await engine.ensureChiefBot();
+    assert.equal(chief1Reuse.created, false);
+    assert.equal(chief1Reuse.agentId, chief1.agentId);
+
+    (engine as unknown as { settings: typeof currentSettings }).settings = {
+      ...currentSettings,
+      fastProvider: "antigravity/gemini-4-hydrogen",
+      chiefProvider: "antigravity/gemini-4-neon",
+    };
+    const chief2 = await engine.ensureChiefBot();
+    assert.equal(chief2.created, true);
+    assert.notEqual(chief2.agentId, chief1.agentId);
+    assert.equal(chief2.modelUsed, "antigravity/gemini-4-neon");
+
+    await engine.stop();
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }

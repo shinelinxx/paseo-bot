@@ -81,8 +81,10 @@ import {
   buildImmediateAckText,
   buildOnboardingMessages,
   classifyMessageTier,
+  doesAgentMatchExpectedConfig,
   ensureAgentJumpLink,
   evaluateWorkerTurnForStream,
+  extractAgentModelPair,
   extractInlineLinksFromMarkdown,
   parseProfilePreferenceFromMemoryNote,
   resolveTierProviderChain,
@@ -203,12 +205,7 @@ function formatLocalHHMM(d: Date): string {
 }
 
 function formatAgentModelPair(agent: unknown): string | undefined {
-  if (!agent || typeof agent !== "object") return undefined;
-  const rec = agent as Record<string, unknown>;
-  const prov = typeof rec.provider === "string" ? rec.provider.trim() : "";
-  const model = typeof rec.model === "string" ? rec.model.trim() : "";
-  if (prov && model) return `${prov}/${model}`;
-  return prov || model || undefined;
+  return extractAgentModelPair(agent);
 }
 
 function extractAssistantText(items: readonly AgentTimelineItem[]): string {
@@ -247,6 +244,8 @@ export class ProactiveEngine {
     handle: ReturnType<PaseoApi["agents"]["ref"]>;
     modelUsed: string;
   }> | null = null;
+  private l1FallbackConfigKey: string | null = null;
+  private l1FallbackModelUsed: string | null = null;
 
   constructor(opts?: ProactiveEngineOptions) {
     this.store = opts?.store ?? new BotStateStore();
@@ -371,12 +370,53 @@ export class ProactiveEngine {
 
     const subCleanup = settingsHandle.subscribe(async (next) => {
       if (next.status === "ready") {
-        if (this.store.get().runtimePaused !== null) {
+        const prev = this.settings;
+        const nextSettings = { ...DEFAULT_BOT_SETTINGS, ...next.values };
+        const l1ConfigChanged =
+          prev.fastProvider !== nextSettings.fastProvider ||
+          prev.fastFallbackProvider !== nextSettings.fastFallbackProvider ||
+          prev.fastThinking !== nextSettings.fastThinking ||
+          prev.homeCwd !== nextSettings.homeCwd ||
+          prev.butlerName !== nextSettings.butlerName ||
+          prev.userName !== nextSettings.userName;
+        const chiefConfigChanged =
+          prev.chiefProvider !== nextSettings.chiefProvider ||
+          prev.chiefModeId !== nextSettings.chiefModeId ||
+          prev.homeCwd !== nextSettings.homeCwd;
+
+        this.settings = nextSettings;
+        if (l1ConfigChanged) {
+          this.ensureL1InFlight = null;
+          this.l1FallbackConfigKey = null;
+          this.l1FallbackModelUsed = null;
+        }
+        if (chiefConfigChanged) {
+          this.ensureChiefInFlight = null;
+        }
+
+        const curState = this.store.get();
+        const staleL1Id = l1ConfigChanged ? curState.l1AgentId : null;
+        if (
+          curState.runtimePaused !== null ||
+          (l1ConfigChanged && curState.l1AgentId !== null) ||
+          (chiefConfigChanged &&
+            (curState.chiefAgentId !== null || curState.chiefWorkspaceId !== null))
+        ) {
           await this.store.mutate((draft) => {
             draft.runtimePaused = null;
+            if (l1ConfigChanged) {
+              draft.l1AgentId = null;
+            }
+            if (chiefConfigChanged) {
+              draft.chiefAgentId = null;
+              draft.chiefWorkspaceId = null;
+            }
           });
         }
-        this.settings = { ...DEFAULT_BOT_SETTINGS, ...next.values };
+        if (staleL1Id) {
+          this.archiveBackgroundSessionIfIdle(staleL1Id);
+        }
+
         await this.reconcileRuntime();
         await this.broadcastSnapshot();
       }
@@ -3049,11 +3089,28 @@ export class ProactiveEngine {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
 
+    const expandedHome = expandHomePath(this.settings.homeCwd);
+    const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
+    const launch = await this.resolveLaunchConfig(
+      opts?.provider?.trim() || this.settings.chiefProvider,
+      this.settings.chiefModeId,
+      homeCwd,
+    );
+
     const state = await this.store.load();
     if (!opts?.reset && state.chiefAgentId) {
       const handle = this.paseo.agents.ref(state.chiefAgentId);
       const refreshed = await handle.refresh().catch(() => null);
-      if (refreshed && !refreshed.agent.archivedAt) {
+      if (
+        refreshed &&
+        !refreshed.agent.archivedAt &&
+        refreshed.agent.status !== "error" &&
+        refreshed.agent.status !== "closed" &&
+        doesAgentMatchExpectedConfig(refreshed.agent, {
+          providerModel: launch.provider,
+          cwd: homeCwd,
+        })
+      ) {
         if (refreshed.agent.workspaceId !== state.chiefWorkspaceId) {
           await this.store.mutate((draft) => {
             draft.chiefWorkspaceId = refreshed.agent.workspaceId ?? null;
@@ -3064,19 +3121,12 @@ export class ProactiveEngine {
           agentId: refreshed.agent.id,
           workspaceId: refreshed.agent.workspaceId ?? null,
           created: false,
-          modelUsed: formatAgentModelPair(refreshed.agent),
+          modelUsed: formatAgentModelPair(refreshed.agent) || launch.provider,
         };
       }
     }
 
-    const expandedHome = expandHomePath(this.settings.homeCwd);
-    const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
     const workspace = await this.paseo.workspaces.open(homeCwd);
-    const launch = await this.resolveLaunchConfig(
-      opts?.provider?.trim() || this.settings.chiefProvider,
-      this.settings.chiefModeId,
-      homeCwd,
-    );
 
     const chief = await this.createAgentWithModeFallback(
       workspace,
@@ -3610,6 +3660,33 @@ export class ProactiveEngine {
     }
   }
 
+  private buildL1ConfigKey(cwd: string): string {
+    return [
+      this.settings.fastProvider.trim(),
+      this.settings.fastFallbackProvider.trim(),
+      this.settings.fastThinking.trim(),
+      cwd,
+    ].join("|");
+  }
+
+  private archiveBackgroundSessionIfIdle(agentId: string): void {
+    if (!this.paseo || !agentId) return;
+    const handle = this.paseo.agents.ref(agentId);
+    void handle
+      .refresh()
+      .then((refreshed) => {
+        if (
+          refreshed &&
+          !refreshed.agent.archivedAt &&
+          refreshed.agent.status !== "running"
+        ) {
+          return handle.archive();
+        }
+        return undefined;
+      })
+      .catch(() => undefined);
+  }
+
   private async ensureWarmL1AgentInternal(opts?: {
     reset?: boolean;
     providerOverride?: string;
@@ -3621,21 +3698,50 @@ export class ProactiveEngine {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
 
+    const expandedHome = expandHomePath(this.settings.homeCwd);
+    const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
+    await this.ensureProviderCatalog(false);
+    const expectedPlan = resolveTierProviderChain("L1", this.settings, this.cachedProviders, {
+      providerOverride: opts?.providerOverride,
+    });
+    const configKey = this.buildL1ConfigKey(homeCwd);
+
     const state = await this.store.load();
     if (!opts?.reset && !opts?.providerOverride && state.l1AgentId) {
       const existingHandle = this.paseo.agents.ref(state.l1AgentId);
       const refreshed = await existingHandle.refresh().catch(() => null);
+      const isHealthy =
+        Boolean(refreshed) &&
+        !refreshed!.agent.archivedAt &&
+        refreshed!.agent.status !== "error" &&
+        refreshed!.agent.status !== "closed";
+      const matchesConfig =
+        isHealthy &&
+        doesAgentMatchExpectedConfig(refreshed!.agent, {
+          providerModel: expectedPlan.chosenProvider,
+          allowedFallbackModel:
+            this.l1FallbackConfigKey === configKey
+              ? (this.l1FallbackModelUsed ?? undefined)
+              : undefined,
+          thinkingOptionId: expectedPlan.thinkingOptionId,
+          cwd: homeCwd,
+        });
+
+      if (isHealthy && matchesConfig) {
+        const modelUsed =
+          formatAgentModelPair(refreshed!.agent) || expectedPlan.chosenProvider;
+        return { handle: existingHandle, modelUsed };
+      }
+
       if (
         refreshed &&
         !refreshed.agent.archivedAt &&
-        refreshed.agent.status !== "error"
+        refreshed.agent.status !== "running"
       ) {
-        const modelUsed =
-          formatAgentModelPair(refreshed.agent) ||
-          resolveTierProviderChain("L1", this.settings, this.cachedProviders).chosenProvider;
-        return { handle: existingHandle, modelUsed };
+        void existingHandle.archive().catch(() => undefined);
       }
-      // Self-heal stale or archived L1 session transparently
+
+      // Self-heal stale, archived, or model-mismatched L1 session transparently
       await this.store.mutate((draft) => {
         if (draft.l1AgentId === state.l1AgentId) {
           draft.l1AgentId = null;
@@ -3643,8 +3749,6 @@ export class ProactiveEngine {
       });
     }
 
-    const expandedHome = expandHomePath(this.settings.homeCwd);
-    const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
     const memoryContent = await this.store
       .readMemory(this.settings.memoryFilePath)
       .catch(() => "");
@@ -3673,9 +3777,20 @@ export class ProactiveEngine {
     });
 
     if (!opts?.providerOverride) {
-      await this.store.mutate((draft) => {
-        draft.l1AgentId = launched.handle.id;
-      });
+      if (this.buildL1ConfigKey(homeCwd) === configKey) {
+        if (launched.modelUsed !== expectedPlan.chosenProvider) {
+          this.l1FallbackConfigKey = configKey;
+          this.l1FallbackModelUsed = launched.modelUsed;
+        } else {
+          this.l1FallbackConfigKey = null;
+          this.l1FallbackModelUsed = null;
+        }
+        await this.store.mutate((draft) => {
+          draft.l1AgentId = launched.handle.id;
+        });
+      } else {
+        this.archiveBackgroundSessionIfIdle(launched.handle.id);
+      }
     }
 
     return {

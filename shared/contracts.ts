@@ -226,6 +226,87 @@ export const KnownWorkspaceSchema = z.object({
 });
 export type KnownWorkspace = z.output<typeof KnownWorkspaceSchema>;
 
+export const RoutingTierSchema = z.enum(["L0", "L1", "L2", "L3"]);
+export type RoutingTier = z.output<typeof RoutingTierSchema>;
+
+export const ChatRoleSchema = z.enum(["user", "assistant", "system"]);
+export type ChatRole = z.output<typeof ChatRoleSchema>;
+
+export const ChatMessageKindSchema = z.enum([
+  "chat",
+  "proactive",
+  "ack",
+  "approval",
+  "memory_update",
+  "status_note",
+]);
+export type ChatMessageKind = z.output<typeof ChatMessageKindSchema>;
+
+export const ChatMessageStatusSchema = z.enum([
+  "sending",
+  "thinking",
+  "done",
+  "error",
+]);
+export type ChatMessageStatus = z.output<typeof ChatMessageStatusSchema>;
+
+export const ChatMessageImageSchema = z.object({
+  mimeType: z.string(),
+  name: z.string().optional(),
+  previewUri: z.string().optional(),
+});
+export type ChatMessageImage = z.output<typeof ChatMessageImageSchema>;
+
+export const ChatInlineLinkSchema = z.object({
+  label: z.string(),
+  url: z.string(),
+  kind: z.enum(["external", "agent", "file"]).default("external"),
+});
+export type ChatInlineLink = z.output<typeof ChatInlineLinkSchema>;
+
+export const ChatMessageSchema = z.object({
+  id: z.string(),
+  createdAt: z.string(),
+  role: ChatRoleSchema,
+  kind: ChatMessageKindSchema.default("chat"),
+  text: z.string(),
+  details: z.string().optional(),
+  images: z.array(ChatMessageImageSchema).default([]),
+  links: z.array(ChatInlineLinkSchema).default([]),
+  quickActions: z.array(FeedActionSchema).default([]),
+  tier: RoutingTierSchema.optional(),
+  modelUsed: z.string().optional(),
+  latencyMs: z.number().int().nonnegative().optional(),
+  status: ChatMessageStatusSchema.default("done"),
+  replyToMessageId: z.string().optional(),
+  approvalId: z.string().optional(),
+  triggerId: z.string().optional(),
+  triggerName: z.string().optional(),
+  agentId: z.string().optional(),
+  workspaceId: z.string().optional(),
+  unread: z.boolean().default(false),
+});
+export type ChatMessage = z.output<typeof ChatMessageSchema>;
+
+export const RoutingTelemetrySchema = z.object({
+  l0Hits: z.number().int().nonnegative().default(0),
+  l1Hits: z.number().int().nonnegative().default(0),
+  l2Hits: z.number().int().nonnegative().default(0),
+  l3Hits: z.number().int().nonnegative().default(0),
+  fallbackCount: z.number().int().nonnegative().default(0),
+  lastTier: RoutingTierSchema.optional(),
+  lastModelUsed: z.string().optional(),
+  lastLatencyMs: z.number().int().nonnegative().optional(),
+});
+export type RoutingTelemetry = z.output<typeof RoutingTelemetrySchema>;
+
+export const TierModelsSchema = z.object({
+  l1: z.string(),
+  l2: z.string(),
+  l3: z.string(),
+});
+export type TierModels = z.output<typeof TierModelsSchema>;
+
 export const BotSnapshotSchema = z.object({
   chiefAgentId: z.string().nullable(),
   chiefWorkspaceId: z.string().nullable(),
@@ -246,8 +327,29 @@ export const BotSnapshotSchema = z.object({
   knownWorkspaces: z.array(KnownWorkspaceSchema).default([]),
   memoryContent: z.string(),
   memoryPath: z.string(),
+  butlerName: z.string().default("Paseo Bot"),
+  userName: z.string().default(""),
+  messages: z.array(ChatMessageSchema).default([]),
+  routingTelemetry: RoutingTelemetrySchema.default({
+    l0Hits: 0,
+    l1Hits: 0,
+    l2Hits: 0,
+    l3Hits: 0,
+    fallbackCount: 0,
+  }),
+  tierModels: TierModelsSchema.optional(),
 });
-export type BotSnapshot = z.output<typeof BotSnapshotSchema>;
+export type ResolvedBotSnapshot = z.output<typeof BotSnapshotSchema>;
+export type BotSnapshot = Omit<
+  ResolvedBotSnapshot,
+  "butlerName" | "userName" | "messages" | "routingTelemetry" | "tierModels"
+> & {
+  butlerName?: string;
+  userName?: string;
+  messages?: ChatMessage[];
+  routingTelemetry?: RoutingTelemetry;
+  tierModels?: TierModels;
+};
 
 // Timeline card schemas
 export const botAlertTimelineSchema = z.object({
@@ -624,5 +726,63 @@ export const tidySessionsRpc = defineRpc({
     actionCount: z.number().int().nonnegative(),
     approvalId: z.string().optional(),
     summary: z.string(),
+  }),
+});
+
+export const SendChatMessageInputSchema = z
+  .object({
+    text: z.string().default(""),
+    images: z.array(WishImageAttachmentSchema).max(MAX_ATTACHED_IMAGES).optional(),
+    replyToMessageId: z.string().optional(),
+    forceTier: z.enum(["L1", "L2", "L3"]).optional(),
+    providerOverride: z.string().optional(),
+    cwd: z.string().optional(),
+  })
+  .refine(
+    (val) =>
+      val.text.trim().length > 0 || (val.images !== undefined && val.images.length > 0),
+    { message: "Chat text or at least one image is required" },
+  );
+export type SendChatMessageInput = z.output<typeof SendChatMessageInputSchema>;
+
+export const SendChatMessageOutputSchema = z.object({
+  userMessageId: z.string(),
+  assistantMessageId: z.string().optional(),
+  ackMessageId: z.string().optional(),
+  tier: RoutingTierSchema,
+  modelUsed: z.string().optional(),
+  escalatedTo: z.enum(["L2", "L3"]).optional(),
+  agentId: z.string().optional(),
+  routedSessionTitle: z.string().optional(),
+});
+export type SendChatMessageOutput = z.output<typeof SendChatMessageOutputSchema>;
+
+export const sendChatMessageRpc = defineRpc({
+  name: "bot.chat.send",
+  input: SendChatMessageInputSchema,
+  output: SendChatMessageOutputSchema,
+});
+
+export const markMessagesReadRpc = defineRpc({
+  name: "bot.chat.mark_read",
+  input: z.object({
+    upToMessageId: z.string().optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    markedCount: z.number().int().nonnegative().optional(),
+  }),
+});
+
+export const updateButlerProfileRpc = defineRpc({
+  name: "bot.profile.update",
+  input: z.object({
+    butlerName: z.string().max(48).optional(),
+    userName: z.string().max(48).optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    butlerName: z.string(),
+    userName: z.string(),
   }),
 });

@@ -4,31 +4,58 @@ import os from "node:os";
 import path from "node:path";
 import type {
   ApprovalItem,
+  ChatMessage,
+  ChatMessageImage,
   DelegatedWorker,
   FeedItem,
+  RoutingTelemetry,
   TriggerSpec,
 } from "../shared/contracts";
+import {
+  buildConclusionSummary,
+  ensureAgentJumpLink,
+  isPlaceholderWorkerReply,
+  projectLegacyFeedToMessages,
+} from "./router.ts";
 
 export interface PersistedBotState {
   chiefAgentId: string | null;
   chiefWorkspaceId: string | null;
+  l1AgentId: string | null;
+  butlerNameOverride: string | null;
+  userNameOverride: string | null;
   runtimePaused: boolean | null;
   wakeTimestamps: number[];
   dismissedSuggestionIds: string[];
   triggers: TriggerSpec[];
   feed: FeedItem[];
+  messages: ChatMessage[];
+  routingTelemetry: RoutingTelemetry;
   approvals: ApprovalItem[];
   workers: DelegatedWorker[];
 }
 
+export const DEFAULT_ROUTING_TELEMETRY: RoutingTelemetry = {
+  l0Hits: 0,
+  l1Hits: 0,
+  l2Hits: 0,
+  l3Hits: 0,
+  fallbackCount: 0,
+};
+
 const DEFAULT_PERSISTED_STATE: PersistedBotState = {
   chiefAgentId: null,
   chiefWorkspaceId: null,
+  l1AgentId: null,
+  butlerNameOverride: null,
+  userNameOverride: null,
   runtimePaused: null,
   wakeTimestamps: [],
   dismissedSuggestionIds: [],
   triggers: [],
   feed: [],
+  messages: [],
+  routingTelemetry: { ...DEFAULT_ROUTING_TELEMETRY },
   approvals: [],
   workers: [],
 };
@@ -121,6 +148,59 @@ function normalizeFeedItem(raw: FeedItem): FeedItem {
   };
 }
 
+const MAX_SAFE_PREVIEW_URI_CHARS = 512;
+
+export function sanitizeChatMessageForStorage(raw: ChatMessage): ChatMessage {
+  const rawImages = Array.isArray(raw.images) ? raw.images : [];
+  const safeImages: ChatMessageImage[] = rawImages
+    .filter((img) => img && typeof img.mimeType === "string" && img.mimeType.length > 0)
+    .map((img) => {
+      const cleanPreview =
+        typeof img.previewUri === "string" &&
+        !img.previewUri.startsWith("data:") &&
+        img.previewUri.length <= MAX_SAFE_PREVIEW_URI_CHARS
+          ? img.previewUri
+          : undefined;
+      return {
+        mimeType: img.mimeType,
+        ...(typeof img.name === "string" && img.name.trim() ? { name: img.name.trim() } : {}),
+        ...(cleanPreview ? { previewUri: cleanPreview } : {}),
+      };
+    });
+
+  return {
+    ...raw,
+    kind: raw.kind ?? "chat",
+    status: raw.status ?? "done",
+    images: safeImages,
+    links: Array.isArray(raw.links) ? raw.links : [],
+    quickActions: Array.isArray(raw.quickActions) ? raw.quickActions : [],
+    unread: typeof raw.unread === "boolean" ? raw.unread : false,
+  };
+}
+
+function normalizeRoutingTelemetry(raw: unknown): RoutingTelemetry {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_ROUTING_TELEMETRY };
+  }
+  const rec = raw as Partial<RoutingTelemetry>;
+  return {
+    l0Hits: typeof rec.l0Hits === "number" && rec.l0Hits >= 0 ? rec.l0Hits : 0,
+    l1Hits: typeof rec.l1Hits === "number" && rec.l1Hits >= 0 ? rec.l1Hits : 0,
+    l2Hits: typeof rec.l2Hits === "number" && rec.l2Hits >= 0 ? rec.l2Hits : 0,
+    l3Hits: typeof rec.l3Hits === "number" && rec.l3Hits >= 0 ? rec.l3Hits : 0,
+    fallbackCount:
+      typeof rec.fallbackCount === "number" && rec.fallbackCount >= 0 ? rec.fallbackCount : 0,
+    ...(rec.lastTier ? { lastTier: rec.lastTier } : {}),
+    ...(typeof rec.lastModelUsed === "string" && rec.lastModelUsed
+      ? { lastModelUsed: rec.lastModelUsed }
+      : {}),
+    ...(typeof rec.lastLatencyMs === "number" && rec.lastLatencyMs >= 0
+      ? { lastLatencyMs: rec.lastLatencyMs }
+      : {}),
+  };
+}
+
 export class BotStateStore {
   private state: PersistedBotState = structuredClone(DEFAULT_PERSISTED_STATE);
   private loaded = false;
@@ -150,10 +230,65 @@ export class BotStateStore {
     try {
       const raw = await fs.readFile(this.stateFilePath, "utf8");
       const parsed = JSON.parse(raw) as Partial<PersistedBotState>;
+      const loadedFeed = Array.isArray(parsed.feed)
+        ? parsed.feed.slice(0, 200).map(normalizeFeedItem)
+        : [];
+      const rawMessages = Array.isArray(parsed.messages)
+        ? parsed.messages
+            .slice(-200)
+            .map(sanitizeChatMessageForStorage)
+            .filter((m) => {
+              // Purge historical empty placeholder proactive/assistant noise ("处理完成。") while preserving user, approval, ack, and error messages
+              if (
+                m.role === "assistant" &&
+                (m.kind === "proactive" || m.kind === "chat") &&
+                m.status !== "error" &&
+                m.status !== "thinking" &&
+                !m.approvalId &&
+                !m.details &&
+                isPlaceholderWorkerReply(m.text)
+              ) {
+                return false;
+              }
+              return true;
+            })
+            .map((m) => {
+              if (m.kind !== "proactive") return m;
+              const nextLinks = m.agentId
+                ? ensureAgentJumpLink(m.links, m.agentId)
+                : m.links;
+              if (m.text.length > 240 && !m.details) {
+                const condensed = buildConclusionSummary(m.text, undefined, 220);
+                return {
+                  ...m,
+                  text: condensed.text,
+                  details: condensed.details,
+                  links: nextLinks,
+                };
+              }
+              return nextLinks === m.links ? m : { ...m, links: nextLinks };
+            })
+        : [];
+      const migratedMessages =
+        rawMessages.length > 0
+          ? rawMessages
+          : loadedFeed.some((f) => f.level !== "silent")
+            ? projectLegacyFeedToMessages(loadedFeed, 20)
+            : [];
+
       this.state = {
         chiefAgentId: typeof parsed.chiefAgentId === "string" ? parsed.chiefAgentId : null,
         chiefWorkspaceId:
           typeof parsed.chiefWorkspaceId === "string" ? parsed.chiefWorkspaceId : null,
+        l1AgentId: typeof parsed.l1AgentId === "string" ? parsed.l1AgentId : null,
+        butlerNameOverride:
+          typeof parsed.butlerNameOverride === "string" && parsed.butlerNameOverride.trim()
+            ? parsed.butlerNameOverride.trim()
+            : null,
+        userNameOverride:
+          typeof parsed.userNameOverride === "string" && parsed.userNameOverride.trim()
+            ? parsed.userNameOverride.trim()
+            : null,
         runtimePaused:
           typeof parsed.runtimePaused === "boolean" ? parsed.runtimePaused : null,
         wakeTimestamps: Array.isArray(parsed.wakeTimestamps)
@@ -163,9 +298,9 @@ export class BotStateStore {
           ? parsed.dismissedSuggestionIds.filter((s): s is string => typeof s === "string")
           : [],
         triggers: Array.isArray(parsed.triggers) ? parsed.triggers.map(normalizeTrigger) : [],
-        feed: Array.isArray(parsed.feed)
-          ? parsed.feed.slice(0, 200).map(normalizeFeedItem)
-          : [],
+        feed: loadedFeed,
+        messages: migratedMessages,
+        routingTelemetry: normalizeRoutingTelemetry(parsed.routingTelemetry),
         approvals: Array.isArray(parsed.approvals) ? parsed.approvals.slice(0, 100) : [],
         workers: Array.isArray(parsed.workers) ? parsed.workers.slice(0, 100) : [],
       };
@@ -184,6 +319,12 @@ export class BotStateStore {
     mutator(this.state);
     if (this.state.feed.length > 200) {
       this.state.feed.length = 200;
+    }
+    if (this.state.messages.length > 200) {
+      this.state.messages = this.state.messages.slice(-200);
+    }
+    for (let i = 0; i < this.state.messages.length; i += 1) {
+      this.state.messages[i] = sanitizeChatMessageForStorage(this.state.messages[i]);
     }
     if (this.state.approvals.length > 100) {
       this.state.approvals.length = 100;
@@ -332,13 +473,6 @@ export class BotStateStore {
   async readMemory(memoryFilePath: string): Promise<string> {
     const resolved = path.resolve(expandHomePath(memoryFilePath));
     const now = Date.now();
-    if (
-      this.memoryCache &&
-      this.memoryCache.resolved === resolved &&
-      now - this.memoryCache.checkedAtMs < 2_000
-    ) {
-      return this.memoryCache.content;
-    }
     try {
       const st = await fs.stat(resolved);
       if (

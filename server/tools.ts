@@ -6,9 +6,9 @@ import {
   GovernanceLevelSchema,
   TriggerKindSchema,
   type FeedAction,
-} from "../shared/contracts";
-import { createShortId } from "./storage";
-import type { ProactiveEngine } from "./engine";
+} from "../shared/contracts.ts";
+import { createShortId } from "./storage.ts";
+import type { ProactiveEngine } from "./engine.ts";
 
 const ToolActionInputSchema = z.object({
   label: z.string().min(1).describe("Short button label, e.g. '一键归档' or '2小时后再提醒'"),
@@ -436,10 +436,55 @@ export function registerBotAgentTools(
       } else {
         await engine.store.appendMemoryNote(memPath, content);
       }
+      const profileSync = await engine.syncProfilePreferencesFromMemoryText(content);
       await engine.broadcastSnapshot();
       return {
         text: `Updated Paseo Bot persistent memory at ${memPath}.`,
-        structuredContent: { path: memPath },
+        structuredContent: {
+          path: memPath,
+          ...(profileSync.changed
+            ? {
+                butlerName: profileSync.butlerName,
+                userName: profileSync.userName,
+              }
+            : {}),
+        },
+      };
+    },
+  });
+
+  const escalateTaskTool = defineAgentTool({
+    name: "paseo_bot_escalate_task",
+    description:
+      "Hand off from the L1 fast concierge to L2 (tool/MCP verification, workspace code/files, or Sentinel-guarded execution) or L3 (deep architecture/planning). Emits ackBubble immediately as Beat 1 and runs handoffBrief in the target tier for Beat 2.",
+    input: z.object({
+      targetTier: z
+        .enum(["L2", "L3"])
+        .describe("L2 for tool/MCP verification & workspace execution; L3 for deep architecture/analysis"),
+      ackBubble: z
+        .string()
+        .min(1)
+        .describe("Warm, natural 1-2 sentence butler transition bubble shown immediately to the user"),
+      handoffBrief: z
+        .string()
+        .min(1)
+        .describe("Complete actionable brief with user goal, known context, and safety constraints"),
+      cwd: z.string().optional().describe("Optional target workspace directory"),
+    }),
+    async execute({ targetTier, ackBubble, handoffBrief, cwd }, { agent, paseo }) {
+      engine.attachPaseo(paseo);
+      engine.recordL1Escalation(agent.id, {
+        targetTier,
+        ackBubble: ackBubble.trim(),
+        handoffBrief: handoffBrief.trim(),
+        cwd: cwd?.trim() || undefined,
+      });
+      return {
+        text: `Queued two-beat handoff to ${targetTier}. Stop here and finish your turn without repeating text.`,
+        structuredContent: {
+          escalated: true,
+          targetTier,
+        },
       };
     },
   });
@@ -498,6 +543,16 @@ export function registerBotAgentTools(
     },
   });
 
+  // Strict minimal-privilege whitelist for L1 fast concierge (no delegate_task or destructive tools)
+  const butlerL1Tools = [
+    memoryReadTool,
+    memoryWriteTool,
+    listTriggersTool,
+    updateTriggerTool,
+    selfWakeTool,
+    escalateTaskTool,
+  ];
+
   const scoutTools = [
     reportOutcomeTool,
     requestApprovalTool,
@@ -534,6 +589,13 @@ export function registerBotAgentTools(
       : "";
 
     const role = request.labels["paseo-bot/role"];
+    if (role === "butler-l1") {
+      return {
+        ...request,
+        tools: [...request.tools, ...butlerL1Tools],
+      };
+    }
+
     if (role === "scout") {
       return {
         ...request,
@@ -541,8 +603,9 @@ export function registerBotAgentTools(
       };
     }
 
-    if (role === "chief") {
-      const memPath = engine.getSettings().memoryFilePath;
+    if (role === "chief" || role === "butler-exec") {
+      const settings = engine.getSettings();
+      const memPath = settings.memoryFilePath;
       const [memory, snap] = await Promise.all([
         engine.store.readMemory(memPath),
         engine.getSnapshot({ includeMemory: false }),
@@ -570,8 +633,8 @@ export function registerBotAgentTools(
           ...(mergedPromptBlock ? [mergedPromptBlock] : []),
           [
             `[Paseo Bot Live State] ${activeSummary}`,
-            `Note: All \`paseo_bot_*\` tools belong to the \`paseo\` MCP server (if a tool such as \`paseo_bot_create_trigger\` is lazy-loaded in your harness, call it via \`call_mcp_tool\` with ServerName="paseo" — no need to inspect plugin source files). Default model preference: \`antigravity/gemini-4-neon\`.`,
-            `[Persistent Memory (${memPath})]\n${memory.slice(0, 6000)}`,
+            `Note: All \`paseo_bot_*\` tools belong to the \`paseo\` MCP server (if a tool such as \`paseo_bot_create_trigger\` is lazy-loaded in your harness, call it via \`call_mcp_tool\` with ServerName="paseo" — no need to inspect plugin source files). Tiered model policy: L1=${settings.fastProvider}, L2=${settings.execProvider}, L3=${settings.deepProvider}.`,
+            ...(role === "chief" ? [`[Persistent Memory (${memPath})]\n${memory.slice(0, 6000)}`] : []),
           ].join("\n\n"),
         ],
       };

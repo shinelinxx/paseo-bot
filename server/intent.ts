@@ -514,7 +514,8 @@ export function draftMissionFromIntent(
 }
 
 export function computeRoutineSuggestions(
-  state: PersistedBotState,
+  state: Pick<PersistedBotState, "dismissedSuggestionIds" | "workers" | "triggers"> &
+    Partial<PersistedBotState>,
   homeCwd: string,
 ): RoutineSuggestion[] {
   const resolvedHome = expandHomePath(homeCwd);
@@ -667,6 +668,14 @@ export function applyApprovalResolutionMutation(
         input.decision === "approved"
           ? `已确认：${found.title}`
           : `已拒绝：${found.title}`;
+    }
+  }
+
+  // Sync inline approval message in single-stream messages
+  for (const m of draft.messages ?? []) {
+    if (m.approvalId === found.id) {
+      m.unread = false;
+      m.status = "done";
     }
   }
 

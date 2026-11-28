@@ -206,17 +206,63 @@ const modalStyles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
   },
-  modelOptionRow: {
+  pickerContentContainer: {
+    paddingHorizontal: 0,
+    paddingTop: 0,
+    paddingBottom: 16,
+    gap: 0,
+  },
+  pickerSearchBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 11,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  pickerSearchInput: {
+    flex: 1,
+    fontSize: 15,
+    paddingVertical: 2,
+    borderWidth: 0,
+    backgroundColor: "transparent",
+  },
+  pickerIconBtn: {
+    padding: 4,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pickerFlatRow: {
+    minHeight: 50,
+    paddingHorizontal: 20,
+    paddingVertical: 13,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderRadius: 10,
-    borderWidth: 1,
+    gap: 12,
   },
-  pillBadge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 999 },
+  pickerRowLeft: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 8,
+  },
+  pickerPrimaryText: {
+    fontSize: 15.5,
+    fontWeight: "400",
+    flexShrink: 1,
+  },
+  pickerSecondaryText: {
+    fontSize: 13,
+    fontWeight: "400",
+  },
+  pickerEmptyWrap: {
+    paddingHorizontal: 20,
+    paddingVertical: 20,
+  },
+  pickerEmptyText: {
+    fontSize: 14,
+  },
   sectionHeader: { fontSize: 12, fontWeight: "700", letterSpacing: 0.3 },
   title14: { fontSize: 14, fontWeight: "700" },
   text11: { fontSize: 11 },
@@ -956,6 +1002,7 @@ export const MemoryEditorModal = memo(function MemoryEditorModal({
 export const ModelPickerModal = memo(function ModelPickerModal({
   selectedProvider,
   defaultProvider,
+  tierDefaults,
   providers,
   loading,
   theme,
@@ -966,6 +1013,7 @@ export const ModelPickerModal = memo(function ModelPickerModal({
 }: {
   selectedProvider: string | null;
   defaultProvider: string;
+  tierDefaults?: readonly string[];
   providers: readonly CatalogProvider[];
   loading: boolean;
   theme: PluginTheme;
@@ -974,7 +1022,47 @@ export const ModelPickerModal = memo(function ModelPickerModal({
   onRefresh: () => void;
   onClose: () => void;
 }) {
-  const defaultReadable = resolveModelLabel(defaultProvider, providers);
+  const [query, setQuery] = useState("");
+
+  const defaultPairSet = useMemo(() => {
+    const set = new Set<string>();
+    if (defaultProvider.trim()) set.add(defaultProvider.trim());
+    for (const item of tierDefaults ?? []) {
+      if (item.trim()) set.add(item.trim());
+    }
+    return set;
+  }, [defaultProvider, tierDefaults]);
+
+  const normalizedQuery = query.trim().toLowerCase();
+
+  const showAutoRow = useMemo(() => {
+    if (!normalizedQuery) return true;
+    const autoHay = `${t("modelPickerAutoTitle")} ${t("modelPickerAutoSub")} auto l0 l1 l2 l3`.toLowerCase();
+    return autoHay.includes(normalizedQuery);
+  }, [normalizedQuery, t]);
+
+  const flatEntries = useMemo(() => {
+    const items: Array<{
+      pair: string;
+      displayTitle: string;
+      isDefault: boolean;
+    }> = [];
+    for (const prov of providers) {
+      for (const m of prov.models) {
+        const pair = `${prov.id}/${m.id}`;
+        if (normalizedQuery) {
+          const hay = `${prov.label} ${prov.id} ${m.label} ${m.id} ${pair}`.toLowerCase();
+          if (!hay.includes(normalizedQuery)) continue;
+        }
+        items.push({
+          pair,
+          displayTitle: `${prov.label} · ${m.label}`,
+          isDefault: Boolean(m.isDefault || defaultPairSet.has(pair)),
+        });
+      }
+    }
+    return items;
+  }, [defaultPairSet, normalizedQuery, providers]);
 
   return (
     <Modal
@@ -984,150 +1072,167 @@ export const ModelPickerModal = memo(function ModelPickerModal({
         if (!next) onClose();
       }}
     >
-      <Modal.Content>
-        <View style={modalStyles.colGap12}>
-          <View
+      <Modal.Content contentContainerStyle={modalStyles.pickerContentContainer}>
+        <View
+          style={[
+            modalStyles.pickerSearchBar,
+            { borderBottomColor: theme.colors.border },
+          ]}
+        >
+          <Icon name="Search" size={16} color={theme.colors.foregroundMuted} />
+          <TextInput
+            value={query}
+            onChangeText={setQuery}
+            placeholder={t("modelPickerSearchPlaceholder")}
+            placeholderTextColor={theme.colors.foregroundMuted}
             style={[
-              modalStyles.insetBox,
-              {
-                borderColor: theme.colors.border,
-                backgroundColor: theme.colors.surface2,
-              },
+              modalStyles.pickerSearchInput,
+              { color: theme.colors.foreground },
+            ]}
+          />
+          {query.length > 0 ? (
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setQuery("")}
+              style={modalStyles.pickerIconBtn}
+            >
+              <Icon name="X" size={15} color={theme.colors.foregroundMuted} />
+            </Pressable>
+          ) : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={t("modelPickerRefresh")}
+            disabled={loading}
+            onPress={onRefresh}
+            style={[
+              modalStyles.pickerIconBtn,
+              { opacity: loading ? 0.4 : 0.85 },
             ]}
           >
-            <View style={modalStyles.rowCenterBetween}>
-              <View style={[modalStyles.rowCenterGap6, modalStyles.flex1]}>
-                <Icon name="GitBranch" size={13} color={theme.colors.accent} />
-                <Text
-                  style={[
-                    modalStyles.text12,
-                    { color: theme.colors.foregroundMuted, flexShrink: 1 },
-                  ]}
-                >
-                  {t("modelPickerInheritHint")}
-                </Text>
-              </View>
-              <Pressable
-                accessibilityRole="button"
-                disabled={loading}
-                onPress={onRefresh}
-                style={[
-                  modalStyles.smallBorderBtn,
-                  {
-                    borderColor: theme.colors.border,
-                    backgroundColor: theme.colors.surface1,
-                    opacity: loading ? 0.6 : 1,
-                  },
-                ]}
-              >
-                <Icon name="RefreshCw" size={11} color={theme.colors.foregroundMuted} />
-                <Text style={[modalStyles.text11, { color: theme.colors.foreground }]}>
-                  {t("modelPickerRefresh")}
-                </Text>
-              </Pressable>
-            </View>
-          </View>
+            <Icon name="RefreshCw" size={15} color={theme.colors.foregroundMuted} />
+          </Pressable>
+        </View>
 
+        {showAutoRow ? (
           <Pressable
             accessibilityRole="button"
             onPress={() => {
               onSelect(null);
               onClose();
             }}
-            style={[
-              modalStyles.modelOptionRow,
+            style={({ pressed }) => [
+              modalStyles.pickerFlatRow,
               {
-                borderColor: !selectedProvider ? theme.colors.accent : theme.colors.border,
-                backgroundColor: !selectedProvider ? theme.colors.surface2 : theme.colors.surface1,
+                backgroundColor: pressed ? theme.colors.surface1 : "transparent",
               },
             ]}
           >
-            <View style={modalStyles.flex1Gap2}>
-              <Text style={[modalStyles.text13Semi, { color: theme.colors.foreground }]}>
-                {t("modelPickerDefaultLabel")}
+            <View style={modalStyles.pickerRowLeft}>
+              <Text
+                numberOfLines={1}
+                style={[
+                  modalStyles.pickerPrimaryText,
+                  { color: theme.colors.foreground },
+                ]}
+              >
+                {t("modelPickerAutoTitle")}
               </Text>
-              <Text style={[modalStyles.text11, { color: theme.colors.foregroundMuted }]}>
-                {defaultReadable && defaultReadable !== defaultProvider
-                  ? `${defaultReadable} · ${defaultProvider}`
-                  : defaultProvider}
+              <Text
+                numberOfLines={1}
+                style={[
+                  modalStyles.pickerSecondaryText,
+                  { color: theme.colors.foregroundMuted },
+                ]}
+              >
+                {t("modelPickerAutoSub")}
               </Text>
             </View>
             {!selectedProvider ? (
-              <Icon name="Check" size={15} color={theme.colors.accent} />
+              <Icon name="Check" size={17} color={theme.colors.foreground} />
             ) : null}
           </Pressable>
+        ) : null}
 
-          {loading && providers.length === 0 ? (
-            <Text style={[modalStyles.text12, { color: theme.colors.foregroundMuted }]}>
+        {loading && providers.length === 0 ? (
+          <View style={modalStyles.pickerEmptyWrap}>
+            <Text
+              style={[
+                modalStyles.pickerEmptyText,
+                { color: theme.colors.foregroundMuted },
+              ]}
+            >
               {t("modelPickerLoading")}
             </Text>
-          ) : providers.length === 0 ? (
-            <Text style={[modalStyles.text12, { color: theme.colors.foregroundMuted }]}>
+          </View>
+        ) : providers.length === 0 ? (
+          <View style={modalStyles.pickerEmptyWrap}>
+            <Text
+              style={[
+                modalStyles.pickerEmptyText,
+                { color: theme.colors.foregroundMuted },
+              ]}
+            >
               {t("modelPickerEmpty")}
             </Text>
-          ) : (
-            providers.map((prov) => (
-              <View key={prov.id} style={modalStyles.colGap6}>
-                <Text style={[modalStyles.sectionHeader, { color: theme.colors.foregroundMuted }]}>
-                  {prov.label}
-                </Text>
-                {prov.models.map((m) => {
-                  const pair = `${prov.id}/${m.id}`;
-                  const active = selectedProvider === pair;
-                  return (
-                    <Pressable
-                      key={pair}
-                      accessibilityRole="button"
-                      onPress={() => {
-                        onSelect(pair);
-                        onClose();
-                      }}
+          </View>
+        ) : flatEntries.length === 0 && !showAutoRow ? (
+          <View style={modalStyles.pickerEmptyWrap}>
+            <Text
+              style={[
+                modalStyles.pickerEmptyText,
+                { color: theme.colors.foregroundMuted },
+              ]}
+            >
+              {t("modelPickerNoMatch")}
+            </Text>
+          </View>
+        ) : (
+          flatEntries.map((entry) => {
+            const active = selectedProvider === entry.pair;
+            return (
+              <Pressable
+                key={entry.pair}
+                accessibilityRole="button"
+                onPress={() => {
+                  onSelect(entry.pair);
+                  onClose();
+                }}
+                style={({ pressed }) => [
+                  modalStyles.pickerFlatRow,
+                  {
+                    backgroundColor: pressed ? theme.colors.surface1 : "transparent",
+                  },
+                ]}
+              >
+                <View style={modalStyles.pickerRowLeft}>
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      modalStyles.pickerPrimaryText,
+                      { color: theme.colors.foreground },
+                    ]}
+                  >
+                    {entry.displayTitle}
+                  </Text>
+                  {entry.isDefault ? (
+                    <Text
+                      numberOfLines={1}
                       style={[
-                        modalStyles.modelOptionRow,
-                        {
-                          borderColor: active ? theme.colors.accent : theme.colors.border,
-                          backgroundColor: active ? theme.colors.surface2 : theme.colors.surface1,
-                        },
+                        modalStyles.pickerSecondaryText,
+                        { color: theme.colors.foregroundMuted },
                       ]}
                     >
-                      <View style={modalStyles.flex1Gap2}>
-                        <View style={modalStyles.rowCenterGap6}>
-                          <Text style={[modalStyles.text13Semi, { color: theme.colors.foreground }]}>
-                            {m.label}
-                          </Text>
-                          {m.isDefault ? (
-                            <View
-                              style={[
-                                modalStyles.pillBadge,
-                                { backgroundColor: theme.colors.surface0 },
-                              ]}
-                            >
-                              <Text
-                                style={[
-                                  modalStyles.text11,
-                                  { color: theme.colors.foregroundMuted },
-                                ]}
-                              >
-                                {t("modelPickerDefault")}
-                              </Text>
-                            </View>
-                          ) : null}
-                        </View>
-                        <Text
-                          numberOfLines={1}
-                          style={[modalStyles.text11, { color: theme.colors.foregroundMuted }]}
-                        >
-                          {m.description ? `${pair} · ${m.description}` : pair}
-                        </Text>
-                      </View>
-                      {active ? <Icon name="Check" size={15} color={theme.colors.accent} /> : null}
-                    </Pressable>
-                  );
-                })}
-              </View>
-            ))
-          )}
-        </View>
+                      {t("modelPickerDefault")}
+                    </Text>
+                  ) : null}
+                </View>
+                {active ? (
+                  <Icon name="Check" size={17} color={theme.colors.foreground} />
+                ) : null}
+              </Pressable>
+            );
+          })
+        )}
       </Modal.Content>
     </Modal>
   );

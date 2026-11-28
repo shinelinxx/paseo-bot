@@ -11,6 +11,8 @@ import {
   setLiveBotSnapshot,
   setLiveBotSummary,
   setRequestedConsoleTab,
+  setRequestedDrawerSection,
+  type ManagementDrawerSection,
 } from "./client/store";
 import {
   BotAlertTimelineCard,
@@ -21,7 +23,6 @@ import {
   BOT_APPROVAL_TIMELINE_KIND,
   botAlertTimelineSchema,
   botApprovalTimelineSchema,
-  ensureChiefBotRpc,
   getBotSnapshotRpc,
   SCREEN_ID,
   SETTINGS_SCREEN_ID,
@@ -33,11 +34,39 @@ import {
   watchBotSummarySubscription,
 } from "./shared/contracts";
 
+function resolveDrawerArg(rawArg: string): ManagementDrawerSection | "chat" | null {
+  const clean = rawArg.trim().toLowerCase();
+  if (!clean || clean === "inbox" || clean === "chat") return "chat";
+  if (
+    clean === "missions" ||
+    clean === "rules" ||
+    clean === "schedules" ||
+    clean === "schedule" ||
+    clean === "plans" ||
+    clean === "plan"
+  ) {
+    return "rules";
+  }
+  if (clean === "approvals" || clean === "approval" || clean === "confirm") {
+    return "approvals";
+  }
+  if (clean === "memory" || clean === "mem") {
+    return "memory";
+  }
+  if (clean === "workers" || clean === "tasks" || clean === "subtasks") {
+    return "workers";
+  }
+  if (clean === "routing" || clean === "status" || clean === "models") {
+    return "routing";
+  }
+  return null;
+}
+
 export default function contribute(client: PluginClientContext) {
   const lifetime = new AbortController();
   let summaryStartupTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Lazy full-state sync: only active while BotConsoleScreen or BotQuickPopover is open
+  // Lazy full-state sync: only active while BotConsoleScreen is mounted
   registerBotFullSync(() => {
     const ctrl = new AbortController();
     const onLifetimeAbort = () => ctrl.abort();
@@ -153,21 +182,13 @@ export default function contribute(client: PluginClientContext) {
       description: messages.message("slashBotDesc"),
       argumentHint: messages.message("slashBotHint"),
       onSubmit({ args, openScreen }) {
-        const rawArg = args.trim().toLowerCase();
-        const tabArg =
-          rawArg === "schedules" || rawArg === "schedule" || rawArg === "plans" || rawArg === "plan"
-            ? "missions"
-            : rawArg;
-        if (
-          tabArg === "inbox" ||
-          tabArg === "approvals" ||
-          tabArg === "missions" ||
-          tabArg === "workers"
-        ) {
-          setRequestedConsoleTab(tabArg);
-          openScreen({ screenId: SCREEN_ID, params: { tab: tabArg } });
+        const target = resolveDrawerArg(args);
+        if (target && target !== "chat") {
+          setRequestedDrawerSection(target);
+          openScreen({ screenId: SCREEN_ID, params: { drawer: target } });
           return;
         }
+        setRequestedConsoleTab("inbox");
         openScreen({ screenId: SCREEN_ID });
       },
     }),
@@ -181,8 +202,8 @@ export default function contribute(client: PluginClientContext) {
         const arg = args.trim().toLowerCase();
         const mode = arg === "apply" || arg === "now" ? "apply" : "preview";
         await rpc(tidySessionsRpc, { mode });
-        setRequestedConsoleTab("inbox");
-        openScreen({ screenId: SCREEN_ID, params: { tab: "inbox" } });
+        setRequestedDrawerSection(null);
+        openScreen({ screenId: SCREEN_ID });
       },
     }),
 
@@ -193,12 +214,8 @@ export default function contribute(client: PluginClientContext) {
       keywords: ["tidy", "rename", "merge", "archive", "整理", "重命名", "合并", "归档", "会话"],
       context: "global",
       async onSelect({ rpc, openScreen }) {
-        const res = await rpc(tidySessionsRpc, { mode: "preview" });
-        if (res.approvalId) {
-          setRequestedConsoleTab("inbox");
-          openScreen({ screenId: SCREEN_ID, params: { tab: "inbox" } });
-          return;
-        }
+        await rpc(tidySessionsRpc, { mode: "preview" });
+        setRequestedDrawerSection(null);
         openScreen({ screenId: SCREEN_ID });
       },
     }),
@@ -207,9 +224,10 @@ export default function contribute(client: PluginClientContext) {
       id: "paseo-bot-open",
       title: messages.message("cmdOpenConsole"),
       icon: "Bot",
-      keywords: ["bot", "wish", "trigger", "rule", "自动规则", "后台", "定时"],
+      keywords: ["bot", "butler", "wish", "chat", "管家", "自动规则", "后台", "定时"],
       context: "global",
       onSelect({ openScreen }) {
+        setRequestedDrawerSection(null);
         openScreen({ screenId: SCREEN_ID });
       },
     }),
@@ -221,8 +239,8 @@ export default function contribute(client: PluginClientContext) {
       keywords: ["schedule", "schedules", "plan", "cron", "trigger", "rule", "计划", "定时", "自动规则"],
       context: "global",
       onSelect({ openScreen }) {
-        setRequestedConsoleTab("missions");
-        openScreen({ screenId: SCREEN_ID, params: { tab: "missions" } });
+        setRequestedDrawerSection("rules");
+        openScreen({ screenId: SCREEN_ID, params: { drawer: "rules" } });
       },
     }),
 
@@ -230,16 +248,11 @@ export default function contribute(client: PluginClientContext) {
       id: "paseo-bot-chat",
       title: messages.message("cmdOpenChat"),
       icon: "Sparkles",
-      keywords: ["bot", "chat", "对话", "助手"],
+      keywords: ["bot", "chat", "butler", "对话", "助手", "管家"],
       context: "global",
-      async onSelect({ rpc, composers, openScreen }) {
-        const res = await rpc(ensureChiefBotRpc, {});
-        const target = composers({ agentId: res.agentId })[0];
-        if (target) {
-          await target.focus().catch(() => openScreen({ screenId: SCREEN_ID }));
-        } else {
-          openScreen({ screenId: SCREEN_ID });
-        }
+      onSelect({ openScreen }) {
+        setRequestedDrawerSection(null);
+        openScreen({ screenId: SCREEN_ID });
       },
     }),
 

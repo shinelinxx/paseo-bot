@@ -7,25 +7,41 @@ import { memo, useCallback, useMemo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { SCREEN_ID } from "../shared/contracts";
 import { messages } from "./i18n";
-import { setRequestedConsoleTab, useBotSidebarCounts } from "./store";
+import { useBotSidebarCounts } from "./store";
 
 const styles = StyleSheet.create({
   trailingRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 4,
+    paddingRight: 2,
   },
-  badge: {
-    paddingHorizontal: 7,
-    paddingVertical: 2,
+  approvalPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 6,
+    paddingVertical: 1.5,
     borderRadius: 999,
-    minWidth: 20,
+    borderWidth: 1,
+  },
+  approvalDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 999,
+  },
+  approvalCountText: {
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  quietDotWrap: {
+    padding: 4,
     alignItems: "center",
     justifyContent: "center",
   },
-  badgeText: {
-    fontSize: 11,
-    fontWeight: "700",
+  quietDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
   },
 });
 
@@ -42,62 +58,71 @@ const PaseoBotSidebarItemInner = memo(function PaseoBotSidebarItemInner({
   const hasRunning = counts.runningWorkerCount > 0;
 
   const handlePress = useCallback(() => {
-    if (hasApprovals) {
-      setRequestedConsoleTab("inbox");
-    }
     openScreen({ screenId: SCREEN_ID });
-  }, [hasApprovals, openScreen]);
+  }, [openScreen]);
 
   const trailing = useMemo(() => {
-    let badgeBg: string | null = null;
-    let badgeFg: string = theme.colors.foreground;
-    let badgeText = "";
-
     if (hasApprovals) {
-      badgeBg = theme.colors.statusWarning;
-      badgeFg = theme.colors.surface0;
-      badgeText = `${counts.pendingApprovalCount}`;
-    } else if (hasUnread) {
-      badgeBg = theme.colors.accent;
-      badgeFg = theme.colors.accentForeground;
-      badgeText = `${counts.unreadCount}`;
-    } else if (hasRunning) {
-      badgeBg = theme.colors.surface2;
-      badgeFg = theme.colors.foregroundMuted;
-      badgeText = `${counts.runningWorkerCount}`;
+      return (
+        <View style={styles.trailingRow}>
+          <Pressable
+            accessibilityRole="button"
+            onPress={handlePress}
+            style={[
+              styles.approvalPill,
+              {
+                borderColor: theme.colors.statusWarning,
+                backgroundColor: theme.colors.surface2,
+              },
+            ]}
+          >
+            <View
+              style={[
+                styles.approvalDot,
+                { backgroundColor: theme.colors.statusWarning },
+              ]}
+            />
+            <Text
+              style={[
+                styles.approvalCountText,
+                { color: theme.colors.statusWarning },
+              ]}
+            >
+              {counts.pendingApprovalCount}
+            </Text>
+          </Pressable>
+        </View>
+      );
     }
 
-    if (!badgeText) return undefined;
+    if (hasUnread || hasRunning) {
+      const dotColor = hasUnread
+        ? theme.colors.accent
+        : theme.colors.foregroundMuted;
+      return (
+        <View style={styles.trailingRow}>
+          <Pressable
+            accessibilityRole="button"
+            onPress={handlePress}
+            style={styles.quietDotWrap}
+          >
+            <View style={[styles.quietDot, { backgroundColor: dotColor }]} />
+          </Pressable>
+        </View>
+      );
+    }
 
-    return (
-      <View style={styles.trailingRow}>
-        <Pressable
-          accessibilityRole="button"
-          onPress={handlePress}
-          style={[
-            styles.badge,
-            { backgroundColor: badgeBg ?? theme.colors.surface2 },
-          ]}
-        >
-          <Text style={[styles.badgeText, { color: badgeFg }]}>{badgeText}</Text>
-        </Pressable>
-      </View>
-    );
+    return undefined;
   }, [
-    hasApprovals,
-    hasUnread,
-    hasRunning,
     counts.pendingApprovalCount,
-    counts.unreadCount,
-    counts.runningWorkerCount,
     handlePress,
-    theme.colors.foreground,
-    theme.colors.statusWarning,
-    theme.colors.surface0,
+    hasApprovals,
+    hasRunning,
+    hasUnread,
     theme.colors.accent,
-    theme.colors.accentForeground,
-    theme.colors.surface2,
     theme.colors.foregroundMuted,
+    theme.colors.statusWarning,
+    theme.colors.surface2,
   ]);
 
   return (

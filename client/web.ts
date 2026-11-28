@@ -111,12 +111,14 @@ interface WebFileReader {
 }
 
 interface WebDocument {
+  hidden?: boolean;
   head?: WebElement | null;
   body?: WebElement | null;
   documentElement?: WebElement | null;
   activeElement?: WebElement | null;
   createElement(tagName: string): WebElement;
   getElementById(id: string): WebElement | null;
+  querySelector?(selector: string): WebElement | null;
   querySelectorAll(selector: string): ArrayLike<WebElement>;
   addEventListener?(
     type: string,
@@ -128,6 +130,12 @@ interface WebDocument {
     listener: (event: WebEvent) => void,
     options?: boolean | { capture?: boolean },
   ): void;
+}
+
+interface WebMutationRecord {
+  target?: WebElement | null;
+  addedNodes?: ArrayLike<WebElement>;
+  removedNodes?: ArrayLike<WebElement>;
 }
 
 interface WebMutationObserver {
@@ -143,7 +151,9 @@ interface WebMutationObserver {
   disconnect(): void;
 }
 
-type WebMutationObserverCtor = new (callback: () => void) => WebMutationObserver;
+type WebMutationObserverCtor = new (
+  callback: (records: ArrayLike<WebMutationRecord>) => void,
+) => WebMutationObserver;
 type WebFileReaderCtor = new () => WebFileReader;
 type WebImageCtor = new () => WebImageElement;
 
@@ -722,6 +732,52 @@ function applyHiddenProjects(doc: WebDocument, spec: HiddenPinnedProjectsSpec): 
   }
 }
 
+const SIDEBAR_ANY_SELECTOR = '[data-testid^="sidebar-"]';
+
+function nodeMayTouchSidebar(el: WebElement | null | undefined): boolean {
+  if (!el || typeof el.getAttribute !== "function") return false;
+  const tid = el.getAttribute("data-testid");
+  if (tid && tid.startsWith("sidebar-")) return true;
+  if (typeof el.closest === "function" && el.closest(SIDEBAR_ANY_SELECTOR)) {
+    return true;
+  }
+  if (typeof el.querySelector === "function" && el.querySelector(SIDEBAR_ANY_SELECTOR)) {
+    return true;
+  }
+  return false;
+}
+
+function mutationsMayTouchSidebar(records: ArrayLike<WebMutationRecord>): boolean {
+  for (let i = 0; i < records.length; i += 1) {
+    const rec = records[i];
+    if (!rec) continue;
+    if (nodeMayTouchSidebar(rec.target)) return true;
+    if (rec.addedNodes) {
+      for (let j = 0; j < rec.addedNodes.length; j += 1) {
+        if (nodeMayTouchSidebar(rec.addedNodes[j])) return true;
+      }
+    }
+    if (rec.removedNodes) {
+      for (let j = 0; j < rec.removedNodes.length; j += 1) {
+        if (nodeMayTouchSidebar(rec.removedNodes[j])) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function resolveSidebarObserveRoot(doc: WebDocument): WebElement | null {
+  const sidebarNodes = doc.querySelectorAll(SIDEBAR_ANY_SELECTOR);
+  if (sidebarNodes.length > 0) {
+    const first = sidebarNodes[0];
+    const semanticSidebar = first?.closest?.("aside, nav, [data-sidebar]");
+    if (semanticSidebar && semanticSidebar !== doc.body && semanticSidebar !== doc.documentElement) {
+      return semanticSidebar;
+    }
+  }
+  return doc.body ?? doc.documentElement ?? null;
+}
+
 /**
  * On Paseo Web & Electron Desktop, hides bottom-section sidebar project folders
  * whose workspaces are already pinned at the top and have no unpinned workspaces left.
@@ -742,29 +798,29 @@ export function mountHiddenSidebarProjectsObserver(
   }
 
   ensureHideStyle(doc);
-  applyHiddenProjects(doc, spec);
+  if (!doc.hidden) {
+    applyHiddenProjects(doc, spec);
+  }
 
-  let rafId: number | null = null;
   let timerId: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
-  const scheduleApply = () => {
-    if (disposed || rafId !== null || timerId !== null) return;
-    if (typeof g.requestAnimationFrame === "function") {
-      rafId = g.requestAnimationFrame(() => {
-        rafId = null;
-        if (!disposed) applyHiddenProjects(doc, spec);
-      });
-    } else {
-      timerId = setTimeout(() => {
-        timerId = null;
-        if (!disposed) applyHiddenProjects(doc, spec);
-      }, 16);
+  const scheduleApply = (records: ArrayLike<WebMutationRecord>) => {
+    if (disposed || doc.hidden) return;
+    if (records.length > 0 && !mutationsMayTouchSidebar(records)) return;
+    if (timerId !== null) {
+      clearTimeout(timerId);
     }
+    timerId = setTimeout(() => {
+      timerId = null;
+      if (!disposed && !doc.hidden) {
+        applyHiddenProjects(doc, spec);
+      }
+    }, 200);
   };
 
   let observer: WebMutationObserver | null = null;
-  const observeRoot = doc.body ?? doc.documentElement;
+  const observeRoot = resolveSidebarObserveRoot(doc);
   if (observeRoot && typeof g.MutationObserver === "function") {
     observer = new g.MutationObserver(scheduleApply);
     observer.observe(observeRoot, {
@@ -777,10 +833,6 @@ export function mountHiddenSidebarProjectsObserver(
 
   return () => {
     disposed = true;
-    if (rafId !== null && typeof g.cancelAnimationFrame === "function") {
-      g.cancelAnimationFrame(rafId);
-      rafId = null;
-    }
     if (timerId !== null) {
       clearTimeout(timerId);
       timerId = null;

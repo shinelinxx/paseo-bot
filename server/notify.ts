@@ -7,7 +7,7 @@ import {
   type BotAlertTimelineData,
   type BotApprovalTimelineData,
   type FeedItem,
-} from "../shared/contracts";
+} from "../shared/contracts.ts";
 
 export async function sendDesktopNotification(opts: {
   enabled: boolean;

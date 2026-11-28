@@ -12,21 +12,24 @@ import {
   manageNativeScheduleRpc,
   manageWorkerRpc,
   markFeedReadRpc,
+  markMessagesReadRpc,
   resolveApprovalRpc,
   runTriggerNowRpc,
   saveMemoryRpc,
+  sendChatMessageRpc,
   setGlobalPauseRpc,
   submitWishRpc,
   tidySessionsRpc,
   toggleTriggerRpc,
+  updateButlerProfileRpc,
   upsertNativeScheduleRpc,
   upsertTriggerRpc,
   watchBotStateSubscription,
   watchBotSummarySubscription,
-} from "./shared/contracts";
-import { paseoBotSettings } from "./shared/settings";
-import { ProactiveEngine } from "./server/engine";
-import { registerBotAgentTools } from "./server/tools";
+} from "./shared/contracts.ts";
+import { paseoBotSettings } from "./shared/settings.ts";
+import { ProactiveEngine } from "./server/engine.ts";
+import { registerBotAgentTools } from "./server/tools.ts";
 
 export default function contribute(server: PluginServerContext) {
   const settingsHandle = server.registerSettings(paseoBotSettings);
@@ -90,6 +93,24 @@ export default function contribute(server: PluginServerContext) {
     engine.attachPaseo(paseo);
     await ready;
     return engine.submitWish(input);
+  });
+
+  server.handle(sendChatMessageRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.sendChatMessage(input);
+  });
+
+  server.handle(markMessagesReadRpc, async ({ upToMessageId }, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.markMessagesRead(upToMessageId);
+  });
+
+  server.handle(updateButlerProfileRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.updateButlerProfile(input);
   });
 
   server.handle(draftMissionRpc, async ({ intent, cwd }, { paseo }) => {
@@ -212,6 +233,11 @@ export default function contribute(server: PluginServerContext) {
             f.unread = false;
           }
         }
+        if (!id) {
+          for (const m of draft.messages) {
+            m.unread = false;
+          }
+        }
       });
       await engine.broadcastSnapshot();
       return { ok: true, removedCount };
@@ -223,6 +249,7 @@ export default function contribute(server: PluginServerContext) {
     await ready;
     const path = engine.getSettings().memoryFilePath;
     await engine.store.writeMemory(path, content);
+    await engine.syncProfilePreferencesFromMemoryText(content);
     await engine.broadcastSnapshot();
     return { ok: true, path };
   });

@@ -12,12 +12,13 @@ import {
 } from "@getpaseo/plugin/server";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import {
+  BOT_ALERT_TIMELINE_KIND,
   type ApprovalItem,
   type ApprovalRisk,
-  type BotSnapshot,
   type BotSummary,
   type CatalogModel,
   type CatalogProvider,
+  type ChatMessage,
   type DelegatedWorker,
   type FeedAction,
   type FeedActionKind,
@@ -30,16 +31,20 @@ import {
   type NativeScheduleUpsertInput,
   type PresetId,
   type PresetInstallResult,
+  type ResolvedBotSnapshot,
   type RoutineSuggestion,
+  type RoutingTier,
+  type SendChatMessageInput,
+  type SendChatMessageOutput,
   type TriggerSpec,
   type TriggerUpsertInput,
   type WishImageAttachment,
-} from "../shared/contracts";
+} from "../shared/contracts.ts";
 import {
   DEFAULT_BOT_SETTINGS,
   type BotSettings,
   type BotSettingsSchema,
-} from "../shared/settings";
+} from "../shared/settings.ts";
 import {
   applyApprovalResolutionMutation,
   applyFeedCurationMutation,
@@ -56,30 +61,46 @@ import {
   routeFollowUpCandidate,
   splitReplyIntoPreviewAndDetails,
   type RoutableAgentCandidate,
-} from "./intent";
+} from "./intent.ts";
 import {
   parseInvalidModeError,
   pickCompatibleModeId,
-} from "./launch-mode";
+} from "./launch-mode.ts";
 import {
   appendChiefAlertCard,
   sendDesktopNotification,
   upsertChiefApprovalCard,
-} from "./notify";
+} from "./notify.ts";
+import {
+  buildButlerExecSystemPrompt,
+  buildButlerL1SystemPrompt,
+  buildProactiveScoutPromptGuidance,
+} from "./prompts.ts";
+import {
+  buildConclusionSummary,
+  buildImmediateAckText,
+  buildOnboardingMessages,
+  classifyMessageTier,
+  ensureAgentJumpLink,
+  evaluateWorkerTurnForStream,
+  extractInlineLinksFromMarkdown,
+  parseProfilePreferenceFromMemoryNote,
+  resolveTierProviderChain,
+} from "./router.ts";
 import {
   BotStateStore,
   computeNormalizedHash,
   createShortId,
   expandHomePath,
   shouldIgnoreWatchPath,
-} from "./storage";
+} from "./storage.ts";
 import {
   buildNativeSchedulePromptWithGovernance,
   getPaseoSchedulesDir,
   parseNativeScheduleRecord,
   readNativeSchedulesFromDisk,
   resolveScheduleCadenceArgs,
-} from "./schedules";
+} from "./schedules.ts";
 import {
   analyzeSessionsForTidy,
   countTidyPlanActions,
@@ -95,8 +116,35 @@ import {
   renderTidyPlanMarkdown,
   saveTidyPlan,
   scoreSessionTopicSimilarity,
-} from "./tidy";
-import { BOT_ALERT_TIMELINE_KIND } from "../shared/contracts";
+} from "./tidy.ts";
+
+export interface RecordedL1Escalation {
+  targetTier: "L2" | "L3";
+  ackBubble: string;
+  handoffBrief: string;
+  cwd?: string;
+}
+
+export interface ProactiveEngineOptions {
+  store?: BotStateStore;
+  l1TimeoutMs?: number;
+  promptsDir?: string;
+}
+
+function stripWorkOrderPrefix(raw: string): string {
+  return raw
+    .replace(
+      /^(?:【(?:告警|提醒|系统通知|高危告警)】\s*|⚠️\s*【[^】]+】\s*|(?:待确认|已完成|正在处理|子任务已完成|子任务出错)\s*[：:·]\s*(?:任务\s*[·：:]\s*)?)/u,
+      "",
+    )
+    .trim();
+}
+
+function isHeavySelfWakePrompt(prompt: string): boolean {
+  return /(?:ssh|git\s+|npm\s+|pnpm\s+|代码|仓库|重构|部署|cloudflare|服务器|修改文件|delegate)/iu.test(
+    prompt,
+  );
+}
 
 interface ActiveFileWatcher {
   watchPath: string;
@@ -174,13 +222,15 @@ function extractAssistantText(items: readonly AgentTimelineItem[]): string {
 }
 
 export class ProactiveEngine {
-  readonly store = new BotStateStore();
+  readonly store: BotStateStore;
+  private readonly l1TimeoutMs: number;
+  private readonly promptsDir?: string;
   private paseo: PaseoApi | null = null;
   private settings: BotSettings = DEFAULT_BOT_SETTINGS;
   private settingsCleanup: (() => void) | null = null;
   private hookCleanups: Array<() => void> = [];
 
-  private readonly subscribers = new Set<(snapshot: BotSnapshot) => void>();
+  private readonly subscribers = new Set<(snapshot: ResolvedBotSnapshot) => void>();
   private readonly summarySubscribers = new Set<(summary: BotSummary) => void>();
   private readonly fileWatchers = new Map<string, ActiveFileWatcher>();
   private readonly inFlightTriggers = new Set<string>();
@@ -190,7 +240,21 @@ export class ProactiveEngine {
     string,
     { triggerId: string; triggerName: string }
   >();
+  private readonly l1Escalations = new Map<string, RecordedL1Escalation>();
+  private readonly chatManagedAgentRuns = new Set<string>();
+  private readonly activeChatExecPromises = new Set<Promise<void>>();
+  private ensureL1InFlight: Promise<{
+    handle: ReturnType<PaseoApi["agents"]["ref"]>;
+    modelUsed: string;
+  }> | null = null;
+
+  constructor(opts?: ProactiveEngineOptions) {
+    this.store = opts?.store ?? new BotStateStore();
+    this.l1TimeoutMs = opts?.l1TimeoutMs ?? 18_000;
+    this.promptsDir = opts?.promptsDir;
+  }
   private readonly reportedTurnAgents = new Set<string>();
+  private readonly repeatInteractiveTurnAgents = new Set<string>();
   private readonly autoRenamedAgents = new Set<string>();
   private readonly duplicateHintedAgents = new Set<string>();
   private readonly pendingDispatches: PendingDispatch[] = [];
@@ -297,7 +361,9 @@ export class ProactiveEngine {
     server: PluginServerContext,
     settingsHandle: PluginSettings<typeof BotSettingsSchema>,
   ): Promise<void> {
+    this.stopped = false;
     const persisted = await this.store.load();
+    await this.reconcileOrphanThinkingAcks();
     await this.reloadSettings(settingsHandle);
     if (typeof persisted.runtimePaused === "boolean") {
       this.settings = { ...this.settings, globalPaused: persisted.runtimePaused };
@@ -364,9 +430,18 @@ export class ProactiveEngine {
     this.hookCleanups = [];
     this.closeAllWatchers();
     await this.closeWebhookServer();
+    if (this.activeChatExecPromises.size > 0) {
+      await Promise.allSettled([...this.activeChatExecPromises]);
+    }
     await this.store.flush().catch(() => undefined);
     this.subscribers.clear();
     this.summarySubscribers.clear();
+  }
+
+  async waitForBackgroundChatTasks(): Promise<void> {
+    while (this.activeChatExecPromises.size > 0) {
+      await Promise.allSettled([...this.activeChatExecPromises]);
+    }
   }
 
   getSettings(): BotSettings {
@@ -949,7 +1024,7 @@ export class ProactiveEngine {
     return { ok: true };
   }
 
-  subscribeSnapshots(listener: (snapshot: BotSnapshot) => void): () => void {
+  subscribeSnapshots(listener: (snapshot: ResolvedBotSnapshot) => void): () => void {
     this.subscribers.add(listener);
     return () => {
       this.subscribers.delete(listener);
@@ -963,12 +1038,128 @@ export class ProactiveEngine {
     };
   }
 
+  getEffectiveButlerName(state = this.store.get()): string {
+    return (
+      state.butlerNameOverride?.trim() ||
+      this.settings.butlerName?.trim() ||
+      "Paseo Bot"
+    );
+  }
+
+  getEffectiveUserName(state = this.store.get()): string {
+    return state.userNameOverride?.trim() || this.settings.userName?.trim() || "";
+  }
+
+  recordL1Escalation(agentId: string, escalation: RecordedL1Escalation): void {
+    this.l1Escalations.set(agentId, escalation);
+  }
+
+  async syncProfilePreferencesFromMemoryText(content: string): Promise<{
+    changed: boolean;
+    butlerName: string;
+    userName: string;
+  }> {
+    const parsed = parseProfilePreferenceFromMemoryNote(content);
+    if (!parsed.butlerName && !parsed.userName) {
+      const state = await this.store.load();
+      return {
+        changed: false,
+        butlerName: this.getEffectiveButlerName(state),
+        userName: this.getEffectiveUserName(state),
+      };
+    }
+
+    let changed = false;
+    const nextState = await this.store.mutate((draft) => {
+      if (parsed.butlerName && draft.butlerNameOverride !== parsed.butlerName) {
+        draft.butlerNameOverride = parsed.butlerName;
+        changed = true;
+      }
+      if (parsed.userName && draft.userNameOverride !== parsed.userName) {
+        draft.userNameOverride = parsed.userName;
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      await this.broadcastSnapshot();
+    }
+    return {
+      changed,
+      butlerName: this.getEffectiveButlerName(nextState),
+      userName: this.getEffectiveUserName(nextState),
+    };
+  }
+
+  async updateButlerProfile(input: {
+    butlerName?: string;
+    userName?: string;
+  }): Promise<{ ok: boolean; butlerName: string; userName: string }> {
+    const nextState = await this.store.mutate((draft) => {
+      if (input.butlerName !== undefined) {
+        const clean = input.butlerName.trim();
+        draft.butlerNameOverride = clean.length > 0 ? clean : null;
+      }
+      if (input.userName !== undefined) {
+        const clean = input.userName.trim();
+        draft.userNameOverride = clean.length > 0 ? clean : null;
+      }
+    });
+    await this.broadcastSnapshot();
+    return {
+      ok: true,
+      butlerName: this.getEffectiveButlerName(nextState),
+      userName: this.getEffectiveUserName(nextState),
+    };
+  }
+
+  async markMessagesRead(upToMessageId?: string): Promise<{
+    ok: boolean;
+    markedCount: number;
+  }> {
+    let markedCount = 0;
+    const cleanUpTo = upToMessageId?.trim();
+    await this.store.mutate((draft) => {
+      let stopReached = false;
+      for (const m of draft.messages) {
+        if (!stopReached && m.unread) {
+          m.unread = false;
+          markedCount += 1;
+        }
+        if (cleanUpTo && m.id === cleanUpTo) {
+          stopReached = true;
+        }
+      }
+      if (!cleanUpTo) {
+        for (const f of draft.feed) {
+          if (f.unread) f.unread = false;
+        }
+      }
+    });
+    if (markedCount > 0 || !cleanUpTo) {
+      await this.broadcastSnapshot();
+    }
+    return { ok: true, markedCount };
+  }
+
+  private countUnreadItems(state: import("./storage.ts").PersistedBotState): number {
+    if (state.messages.length > 0) {
+      let count = 0;
+      for (const m of state.messages) {
+        if (m.unread && m.role !== "user") count += 1;
+      }
+      return count;
+    }
+    let count = 0;
+    for (const f of state.feed) {
+      if (f.unread && f.level !== "silent") count += 1;
+    }
+    return count;
+  }
+
   async getSummary(): Promise<BotSummary> {
     const state = await this.store.load();
-    let unreadCount = 0;
-    for (const f of state.feed) {
-      if (f.unread && f.level !== "silent") unreadCount += 1;
-    }
+    const unreadCount = this.countUnreadItems(state);
     let pendingApprovalCount = 0;
     for (const a of state.approvals) {
       if (a.status === "pending") pendingApprovalCount += 1;
@@ -998,7 +1189,7 @@ export class ProactiveEngine {
     }
   }
 
-  async getSnapshot(opts?: { includeMemory?: boolean }): Promise<BotSnapshot> {
+  async getSnapshot(opts?: { includeMemory?: boolean }): Promise<ResolvedBotSnapshot> {
     const now = Date.now();
     const [state, memoryContent] = await Promise.all([
       this.store.load(),
@@ -1007,10 +1198,7 @@ export class ProactiveEngine {
         : this.store.readMemory(this.settings.memoryFilePath),
     ]);
 
-    let unreadCount = 0;
-    for (const f of state.feed) {
-      if (f.unread && f.level !== "silent") unreadCount += 1;
-    }
+    const unreadCount = this.countUnreadItems(state);
     let pendingApprovalCount = 0;
     for (const a of state.approvals) {
       if (a.status === "pending") pendingApprovalCount += 1;
@@ -1038,6 +1226,51 @@ export class ProactiveEngine {
       void this.refreshWorkspaceDirsInBackground(false);
     }
 
+    const butlerName = this.getEffectiveButlerName(state);
+    const userName = this.getEffectiveUserName(state);
+    const l1Plan = resolveTierProviderChain("L1", this.settings, this.cachedProviders);
+    const l2Plan = resolveTierProviderChain("L2", this.settings, this.cachedProviders);
+    const l3Plan = resolveTierProviderChain("L3", this.settings, this.cachedProviders);
+
+    const rawSlice =
+      state.messages.length > 0
+        ? state.messages.slice(-40)
+        : buildOnboardingMessages({ butlerName, userName });
+    const untrimmedTailStart = Math.max(0, rawSlice.length - 12);
+    const visibleMessages = rawSlice.map((m, idx) => {
+      if (idx < untrimmedTailStart && m.details && m.details.length > 2500) {
+        return {
+          ...m,
+          details: `${m.details.slice(0, 2500)}\n\n…（历史长明细已折叠省略）`,
+        };
+      }
+      return m;
+    });
+
+    const pendingApprovals = state.approvals.filter((a) => a.status === "pending");
+    const resolvedApprovals = state.approvals.filter((a) => a.status !== "pending");
+    const keptApprovalIds = new Set<string>([
+      ...pendingApprovals.map((a) => a.id),
+      ...resolvedApprovals
+        .slice(0, Math.max(0, 15 - pendingApprovals.length))
+        .map((a) => a.id),
+    ]);
+    const snapshotApprovals = state.approvals.filter((a) => keptApprovalIds.has(a.id));
+
+    const activeWorkers = state.workers.filter(
+      (w) => w.status === "running" || w.status === "permission",
+    );
+    const finishedWorkers = state.workers.filter(
+      (w) => w.status !== "running" && w.status !== "permission",
+    );
+    const keptWorkerIds = new Set<string>([
+      ...activeWorkers.map((w) => w.id),
+      ...finishedWorkers
+        .slice(0, Math.max(0, 15 - activeWorkers.length))
+        .map((w) => w.id),
+    ]);
+    const snapshotWorkers = state.workers.filter((w) => keptWorkerIds.has(w.id));
+
     return {
       chiefAgentId: state.chiefAgentId,
       chiefWorkspaceId: state.chiefWorkspaceId,
@@ -1051,13 +1284,22 @@ export class ProactiveEngine {
       totalSilentChecks,
       triggers: state.triggers,
       nativeSchedules: this.cachedNativeSchedules,
-      feed: state.feed.slice(0, 40),
-      approvals: state.approvals.slice(0, 25),
-      workers: state.workers.slice(0, 25),
+      feed: [],
+      approvals: snapshotApprovals,
+      workers: snapshotWorkers,
       routineSuggestions: this.getMemoizedSuggestions(state),
       knownWorkspaces: this.buildKnownWorkspaces(state),
       memoryContent,
       memoryPath: this.settings.memoryFilePath,
+      butlerName,
+      userName,
+      messages: visibleMessages,
+      routingTelemetry: state.routingTelemetry,
+      tierModels: {
+        l1: l1Plan.chosenProvider,
+        l2: l2Plan.chosenProvider,
+        l3: l3Plan.chosenProvider,
+      },
     };
   }
 
@@ -1107,7 +1349,7 @@ export class ProactiveEngine {
           })
           .catch(() => undefined);
       }
-    }, 40);
+    }, 120);
     this.broadcastTimer.unref?.();
   }
 
@@ -1234,6 +1476,9 @@ export class ProactiveEngine {
     );
     const signature = sigParts.sort().join("|");
     if (signature && signature === entry.lastStatSignature) {
+      await this.store.mutateDeferred((draft) => {
+        draft.routingTelemetry.l0Hits += 1;
+      }, 15_000);
       return;
     }
     entry.lastStatSignature = signature;
@@ -1404,6 +1649,9 @@ export class ProactiveEngine {
 
     const matchRe = this.compileRegex(trigger.matchRegex);
     if (matchRe && !matchRe.test(detail)) {
+      await this.store.mutateDeferred((draft) => {
+        draft.routingTelemetry.l0Hits += 1;
+      }, 15_000);
       sendJson(200, { ok: true, filtered: true, reason: "Did not match regex" });
       return;
     }
@@ -1567,6 +1815,7 @@ export class ProactiveEngine {
       const matchRe = this.compileRegex(trigger.matchRegex);
       if (matchRe && !matchRe.test(output)) {
         await this.store.mutateDeferred((draft) => {
+          draft.routingTelemetry.l0Hits += 1;
           const t = draft.triggers.find((item) => item.id === trigger.id);
           if (t) {
             t.lastCheckedAt = checkedIso;
@@ -1581,6 +1830,7 @@ export class ProactiveEngine {
       // First baseline capture: record hash silently so creating a poller doesn't burn tokens immediately
       if (!trigger.lastDiffHash) {
         await this.store.mutate((draft) => {
+          draft.routingTelemetry.l0Hits += 1;
           const t = draft.triggers.find((item) => item.id === trigger.id);
           if (t) {
             t.lastCheckedAt = checkedIso;
@@ -1594,6 +1844,7 @@ export class ProactiveEngine {
 
       if (trigger.lastDiffHash === nextHash) {
         await this.store.mutateDeferred((draft) => {
+          draft.routingTelemetry.l0Hits += 1;
           const t = draft.triggers.find((item) => item.id === trigger.id);
           if (t) {
             t.lastCheckedAt = checkedIso;
@@ -2034,7 +2285,14 @@ export class ProactiveEngine {
         a.labels && typeof a.labels === "object"
           ? (a.labels as Record<string, unknown>)
           : undefined;
-      if (isBg || labels?.["paseo-bot/role"] === "scout") continue;
+      if (
+        isBg ||
+        labels?.["paseo-bot/role"] === "scout" ||
+        labels?.["paseo-bot/role"] === "butler-l1" ||
+        labels?.["paseo-bot/role"] === "butler-exec"
+      ) {
+        continue;
+      }
 
       const wsId = typeof a.workspaceId === "string" ? a.workspaceId : undefined;
       const wsMeta = wsId ? wsMap.get(wsId) : undefined;
@@ -2338,7 +2596,8 @@ export class ProactiveEngine {
     workspaceId?: string;
     notifyDesktop?: boolean;
     appendChiefTimeline?: boolean;
-    beforeMutate?: (draft: import("./storage").PersistedBotState) => void;
+    skipStreamMessage?: boolean;
+    beforeMutate?: (draft: import("./storage.ts").PersistedBotState) => void;
   }): Promise<FeedItem> {
     const item: FeedItem = {
       id: createShortId("feed"),
@@ -2358,19 +2617,78 @@ export class ProactiveEngine {
     };
 
     let chiefId: string | null = null;
+    let butlerNameForNotify = "Paseo Bot";
     await this.store.mutate((draft) => {
       input.beforeMutate?.(draft);
       draft.feed.unshift(item);
       chiefId = draft.chiefAgentId;
+      butlerNameForNotify = this.getEffectiveButlerName(draft);
+
+      if (input.level === "silent") {
+        // Silent checks NEVER pollute single-stream messages
+        draft.routingTelemetry.l0Hits += 1;
+        return;
+      }
+
+      if (input.skipStreamMessage || input.inProgress) {
+        return;
+      }
+      if (input.agentId && this.chatManagedAgentRuns.has(input.agentId)) {
+        return;
+      }
+
+      const cleanText = stripWorkOrderPrefix(item.summary) || cleanTaskTitle(item.title);
+      const inlineLinks = extractInlineLinksFromMarkdown(
+        `${item.summary}\n${item.details ?? ""}`,
+      );
+      if (input.level === "approval_required") {
+        draft.messages.push({
+          id: createShortId("msg"),
+          createdAt: item.createdAt,
+          role: "assistant",
+          kind: "approval",
+          text: cleanText,
+          details: item.details,
+          images: [],
+          links: inlineLinks,
+          quickActions: [],
+          status: "done",
+          approvalId: item.approvalId,
+          triggerId: item.triggerId,
+          triggerName: item.triggerName,
+          agentId: item.agentId,
+          workspaceId: item.workspaceId,
+          unread: Boolean(item.unread),
+        });
+      } else {
+        draft.messages.push({
+          id: createShortId("msg"),
+          createdAt: item.createdAt,
+          role: "assistant",
+          kind: "proactive",
+          text: cleanText,
+          details: item.details,
+          images: [],
+          links: inlineLinks,
+          quickActions: (item.actions ?? []).slice(0, 2),
+          status: input.level === "error" ? "error" : "done",
+          approvalId: item.approvalId,
+          triggerId: item.triggerId,
+          triggerName: item.triggerName,
+          agentId: item.agentId,
+          workspaceId: item.workspaceId,
+          unread: Boolean(item.unread),
+        });
+      }
     });
     await this.broadcastSnapshot();
 
     if (input.notifyDesktop && input.level !== "silent") {
       void sendDesktopNotification({
         enabled: this.settings.desktopNotify,
-        title: `Paseo Bot · ${item.title}`,
+        title: `${butlerNameForNotify} · ${cleanTaskTitle(item.title)}`,
         subtitle: item.triggerName,
-        body: item.summary,
+        body: stripWorkOrderPrefix(item.summary),
       });
     }
     if (input.appendChiefTimeline !== false && input.level !== "silent") {
@@ -2389,15 +2707,18 @@ export class ProactiveEngine {
     actions?: FeedAction[];
     notifyDesktop?: boolean;
     appendChiefTimeline?: boolean;
-    beforeMutate?: (draft: import("./storage").PersistedBotState) => void;
+    skipStreamMessage?: boolean;
+    beforeMutate?: (draft: import("./storage.ts").PersistedBotState) => void;
   }): Promise<FeedItem> {
     const nowIso = new Date().toISOString();
     let finalItem!: FeedItem;
     let chiefId: string | null = null;
+    let butlerNameForNotify = "Paseo Bot";
 
     await this.store.mutate((draft) => {
       input.beforeMutate?.(draft);
       chiefId = draft.chiefAgentId;
+      butlerNameForNotify = this.getEffectiveButlerName(draft);
 
       // Find an in-progress or initial 'wish' card for this same agentId to update in place
       const existingIdx = draft.feed.findIndex(
@@ -2438,6 +2759,41 @@ export class ProactiveEngine {
         draft.feed.unshift(created);
         finalItem = { ...created };
       }
+
+      if (input.level === "silent") {
+        draft.routingTelemetry.l0Hits += 1;
+        return;
+      }
+
+      if (input.skipStreamMessage || this.chatManagedAgentRuns.has(input.agentId)) {
+        return;
+      }
+
+      const cleanShortTitle = cleanTaskTitle(finalItem.title);
+      const cleanText = stripWorkOrderPrefix(finalItem.summary) || cleanShortTitle;
+      const rawLinks = extractInlineLinksFromMarkdown(
+        `${finalItem.summary}\n${finalItem.details ?? ""}`,
+      );
+      const inlineLinks = ensureAgentJumpLink(
+        rawLinks,
+        input.agentId,
+        cleanShortTitle,
+      );
+      draft.messages.push({
+        id: createShortId("msg"),
+        createdAt: nowIso,
+        role: "assistant",
+        kind: input.level === "approval_required" ? "approval" : "proactive",
+        text: cleanText,
+        details: finalItem.details,
+        images: [],
+        links: inlineLinks,
+        quickActions: (finalItem.actions ?? []).slice(0, 2),
+        status: input.level === "error" ? "error" : "done",
+        agentId: input.agentId,
+        workspaceId: input.workspaceId,
+        unread: Boolean(finalItem.unread),
+      });
     });
 
     await this.broadcastSnapshot();
@@ -2445,9 +2801,9 @@ export class ProactiveEngine {
     if (input.notifyDesktop && input.level !== "silent") {
       void sendDesktopNotification({
         enabled: this.settings.desktopNotify,
-        title: `Paseo Bot · ${finalItem.title}`,
+        title: `${butlerNameForNotify} · ${cleanTaskTitle(finalItem.title)}`,
         subtitle: finalItem.triggerName,
-        body: finalItem.summary,
+        body: stripWorkOrderPrefix(finalItem.summary),
       });
     }
     if (input.appendChiefTimeline !== false && input.level !== "silent") {
@@ -2600,6 +2956,26 @@ export class ProactiveEngine {
                 f.unread = false;
               }
             }
+            for (const m of draft.messages) {
+              if (m.approvalId === input.id) {
+                m.unread = false;
+                m.status = "done";
+              }
+            }
+            draft.messages.push({
+              id: createShortId("msg"),
+              createdAt: new Date().toISOString(),
+              role: "assistant",
+              kind: "chat",
+              text: summaryLine,
+              details: detailLines,
+              images: [],
+              links: [],
+              quickActions: [],
+              tier: "L0",
+              status: "done",
+              unread: false,
+            });
           });
           await upsertChiefApprovalCard(this.paseo, chiefId, target);
           await this.broadcastSnapshot();
@@ -2744,6 +3120,7 @@ export class ProactiveEngine {
     titleOverride?: string;
     extraContext?: string;
     skipDirectSessionRouting?: boolean;
+    skipStreamMessage?: boolean;
     asyncLaunch?: boolean;
   }): Promise<{
     agentId: string;
@@ -2772,6 +3149,27 @@ export class ProactiveEngine {
     });
     if (!cleanWish && attachedImages.length === 0) {
       throw new Error("Wish text or at least one image is required");
+    }
+
+    if (!input.skipStreamMessage) {
+      const safeImages = (input.images ?? []).map((img) => ({
+        mimeType: img.mimeType,
+        ...(img.name ? { name: img.name } : {}),
+      }));
+      await this.store.mutate((draft) => {
+        draft.messages.push({
+          id: createShortId("msg"),
+          createdAt: new Date().toISOString(),
+          role: "user",
+          kind: "chat",
+          text: cleanWish || formatImageSummaryTag(attachedImages.length),
+          images: safeImages,
+          links: [],
+          quickActions: [],
+          status: "done",
+          unread: false,
+        });
+      });
     }
 
     // If the wish explicitly locates an existing session (by session ID / conversation:// / quoted workspace),
@@ -3075,6 +3473,1126 @@ export class ProactiveEngine {
     };
   }
 
+  private async launchTieredAgentWithFallback(params: {
+    tier: "L1" | "L2" | "L3";
+    cwd: string;
+    title: string;
+    systemPrompt?: string;
+    prompt?: string;
+    images?: Array<{ data: string; mimeType: string }>;
+    background?: boolean;
+    labels: Record<string, string>;
+    providerOverride?: string;
+    preferredModeIdOverride?: string;
+    isDelegatedWorker?: boolean;
+    useWorktree?: boolean;
+  }): Promise<{
+    handle: Awaited<
+      ReturnType<Awaited<ReturnType<PaseoApi["workspaces"]["open"]>>["agents"]["create"]>
+    >;
+    workspaceId: string | null;
+    modelUsed: string;
+    degraded: boolean;
+  }> {
+    if (!this.paseo) {
+      throw new Error("Paseo daemon connection is not initialized yet");
+    }
+    const paseo = this.paseo;
+    await this.ensureProviderCatalog(false);
+    const plan = resolveTierProviderChain(params.tier, this.settings, this.cachedProviders, {
+      providerOverride: params.providerOverride,
+      isDelegatedWorker: params.isDelegatedWorker,
+    });
+
+    const preferredModeId = params.preferredModeIdOverride || plan.preferredModeId;
+    const workspace = params.useWorktree
+      ? await paseo.workspaces.create({
+          title: params.title,
+          source: {
+            kind: "worktree",
+            cwd: params.cwd,
+            action: "branch-off",
+          },
+        })
+      : await paseo.workspaces.open(params.cwd);
+
+    const orderedCandidates = [
+      plan.chosenProvider,
+      ...plan.candidateChain.filter((c) => c !== plan.chosenProvider),
+    ];
+
+    let lastErr: unknown;
+    let runtimeFallbackOccurred = plan.degraded;
+
+    for (let idx = 0; idx < orderedCandidates.length; idx += 1) {
+      const candidateProvider = orderedCandidates[idx];
+      if (idx > 0) {
+        runtimeFallbackOccurred = true;
+      }
+      const provId = candidateProvider.includes("/")
+        ? candidateProvider.split("/", 2)[0]
+        : candidateProvider;
+      const matchedCatalogProv = this.cachedProviders.find((p) => p.id === provId);
+      const modes = await this.getProviderModesForCwd(
+        provId,
+        params.cwd,
+        matchedCatalogProv?.modes,
+      );
+      const modeId =
+        modes.length > 0
+          ? pickCompatibleModeId(preferredModeId, modes)
+          : preferredModeId || undefined;
+      // Preserve high thinking when L3 degrades to L2 provider
+      const thinkingOptionId =
+        params.tier === "L3" && runtimeFallbackOccurred ? "high" : plan.thinkingOptionId;
+
+      try {
+        const created = await this.createAgentWithModeFallback(
+          workspace,
+          {
+            config: {
+              provider: candidateProvider,
+              ...(modeId ? { modeId } : {}),
+              ...(thinkingOptionId ? { thinkingOptionId } : {}),
+              ...(params.systemPrompt ? { systemPrompt: params.systemPrompt } : {}),
+            },
+            title: params.title,
+            ...(params.prompt ? { prompt: params.prompt } : {}),
+            ...(params.images && params.images.length > 0 ? { images: params.images } : {}),
+            ...(params.background !== undefined ? { background: params.background } : {}),
+            labels: params.labels,
+          },
+          { preferredModeId, cwd: params.cwd },
+        );
+
+        if (runtimeFallbackOccurred) {
+          await this.store.mutate((draft) => {
+            draft.routingTelemetry.fallbackCount += 1;
+          });
+        }
+
+        return {
+          handle: created,
+          workspaceId: created.workspaceId ?? workspace.id ?? null,
+          modelUsed: candidateProvider,
+          degraded: runtimeFallbackOccurred,
+        };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(String(lastErr ?? "Failed to launch tiered agent"));
+  }
+
+  private async ensureWarmL1Agent(opts?: {
+    reset?: boolean;
+    providerOverride?: string;
+  }): Promise<{
+    handle: ReturnType<PaseoApi["agents"]["ref"]>;
+    modelUsed: string;
+  }> {
+    if (this.ensureL1InFlight && !opts?.reset && !opts?.providerOverride) {
+      return this.ensureL1InFlight;
+    }
+    const task = this.ensureWarmL1AgentInternal(opts);
+    if (!opts?.reset && !opts?.providerOverride) {
+      this.ensureL1InFlight = task;
+    }
+    try {
+      return await task;
+    } finally {
+      if (this.ensureL1InFlight === task) {
+        this.ensureL1InFlight = null;
+      }
+    }
+  }
+
+  private async ensureWarmL1AgentInternal(opts?: {
+    reset?: boolean;
+    providerOverride?: string;
+  }): Promise<{
+    handle: ReturnType<PaseoApi["agents"]["ref"]>;
+    modelUsed: string;
+  }> {
+    if (!this.paseo) {
+      throw new Error("Paseo daemon connection is not initialized yet");
+    }
+
+    const state = await this.store.load();
+    if (!opts?.reset && !opts?.providerOverride && state.l1AgentId) {
+      const existingHandle = this.paseo.agents.ref(state.l1AgentId);
+      const refreshed = await existingHandle.refresh().catch(() => null);
+      if (
+        refreshed &&
+        !refreshed.agent.archivedAt &&
+        refreshed.agent.status !== "error"
+      ) {
+        const modelUsed =
+          formatAgentModelPair(refreshed.agent) ||
+          resolveTierProviderChain("L1", this.settings, this.cachedProviders).chosenProvider;
+        return { handle: existingHandle, modelUsed };
+      }
+      // Self-heal stale or archived L1 session transparently
+      await this.store.mutate((draft) => {
+        if (draft.l1AgentId === state.l1AgentId) {
+          draft.l1AgentId = null;
+        }
+      });
+    }
+
+    const expandedHome = expandHomePath(this.settings.homeCwd);
+    const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
+    const memoryContent = await this.store
+      .readMemory(this.settings.memoryFilePath)
+      .catch(() => "");
+    const butlerName = this.getEffectiveButlerName(state);
+    const userName = this.getEffectiveUserName(state);
+    const systemPrompt = await buildButlerL1SystemPrompt(
+      {
+        butlerName,
+        userName,
+        memoryContent,
+        memoryPath: this.settings.memoryFilePath,
+      },
+      { promptsDir: this.promptsDir },
+    );
+
+    const launched = await this.launchTieredAgentWithFallback({
+      tier: "L1",
+      cwd: homeCwd,
+      title: `${butlerName} · L1`,
+      systemPrompt,
+      background: true,
+      labels: {
+        "paseo-bot/role": "butler-l1",
+      },
+      providerOverride: opts?.providerOverride,
+    });
+
+    if (!opts?.providerOverride) {
+      await this.store.mutate((draft) => {
+        draft.l1AgentId = launched.handle.id;
+      });
+    }
+
+    return {
+      handle: launched.handle,
+      modelUsed: launched.modelUsed,
+    };
+  }
+
+  private async resolveTargetExecutionCwd(
+    explicitCwd: string | undefined,
+    intentText: string,
+    memoryContent: string,
+  ): Promise<string> {
+    const expandedExplicit = explicitCwd?.trim() ? expandHomePath(explicitCwd.trim()) : "";
+    if (expandedExplicit && (await pathExists(expandedExplicit))) {
+      return expandedExplicit;
+    }
+    const inferred = intentText
+      ? inferWorkspaceAndWatchPath(
+          intentText,
+          this.settings.homeCwd,
+          this.buildKnownWorkspaces(this.store.get()),
+          memoryContent,
+        ).cwd
+      : "";
+    if (inferred && (await pathExists(inferred))) {
+      return inferred;
+    }
+    const expandedHome = expandHomePath(this.settings.homeCwd);
+    if (await pathExists(expandedHome)) {
+      return expandedHome;
+    }
+    return os.homedir();
+  }
+
+  async reconcileOrphanThinkingAcks(): Promise<number> {
+    const state = await this.store.load();
+    const activeWorkerIds = new Set<string>();
+    for (const w of state.workers) {
+      if (w.status === "running" || w.status === "permission") {
+        if (w.agentId) activeWorkerIds.add(w.agentId);
+        if (w.id) activeWorkerIds.add(w.id);
+      }
+    }
+
+    const orphanAckIds = new Set<string>();
+    for (let i = 0; i < state.messages.length; i += 1) {
+      const msg = state.messages[i];
+      if (msg.kind !== "ack" || msg.status !== "thinking") continue;
+
+      const linkedToActiveWorker = Boolean(
+        (msg.agentId && activeWorkerIds.has(msg.agentId)) ||
+          msg.links?.some((l) => {
+            const match = l.url.match(/^paseo:\/\/agent\/(.+)$/);
+            return Boolean(match?.[1] && activeWorkerIds.has(match[1]));
+          }),
+      );
+      if (linkedToActiveWorker) continue;
+
+      let hasSubsequentReply = false;
+      let passedNextUserTurn = false;
+      for (let j = i + 1; j < state.messages.length; j += 1) {
+        const later = state.messages[j];
+        if (later.role === "user") {
+          passedNextUserTurn = true;
+          continue;
+        }
+        if (later.role === "assistant" && later.kind !== "ack") {
+          if (
+            later.replyToMessageId === msg.id ||
+            (msg.replyToMessageId && later.replyToMessageId === msg.replyToMessageId) ||
+            !passedNextUserTurn
+          ) {
+            hasSubsequentReply = true;
+            break;
+          }
+        }
+      }
+      if (hasSubsequentReply) continue;
+
+      orphanAckIds.add(msg.id);
+    }
+
+    if (orphanAckIds.size === 0) return 0;
+
+    await this.store.mutate((draft) => {
+      for (const m of draft.messages) {
+        if (orphanAckIds.has(m.id) && m.kind === "ack" && m.status === "thinking") {
+          m.status = "error";
+          m.text = "刚才插件正好重启中断了，你可以直接重发这条消息。";
+          m.unread = false;
+        }
+      }
+    });
+    return orphanAckIds.size;
+  }
+
+  private dispatchTwoBeatExecution(params: {
+    targetTier: "L2" | "L3";
+    ackMessageId: string;
+    brief: string;
+    cwd?: string;
+    providerOverride?: string;
+    attachedImages?: Array<{ data: string; mimeType: string }>;
+  }): void {
+    if (this.stopped) {
+      const abortPromise: Promise<void> = this.store
+        .mutate((draft) => {
+          const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+          if (ack) {
+            ack.status = "error";
+            ack.text = "刚才插件正好重启中断了，你可以直接重发这条消息。";
+            ack.unread = false;
+          }
+        })
+        .then(
+          () => undefined,
+          () => undefined,
+        );
+      this.activeChatExecPromises.add(abortPromise);
+      void abortPromise.finally(() => {
+        this.activeChatExecPromises.delete(abortPromise);
+      });
+      return;
+    }
+
+    const bgPromise = (async () => {
+      const startMs = Date.now();
+      let execHandleId: string | undefined;
+      try {
+        const state = await this.store.load();
+        if (this.stopped) {
+          throw new Error("Plugin stopped before launching background execution");
+        }
+        const memoryContent = await this.store
+          .readMemory(this.settings.memoryFilePath)
+          .catch(() => "");
+        const targetCwd = await this.resolveTargetExecutionCwd(
+          params.cwd,
+          params.brief,
+          memoryContent,
+        );
+        const butlerName = this.getEffectiveButlerName(state);
+        const userName = this.getEffectiveUserName(state);
+        const systemPrompt = await buildButlerExecSystemPrompt(
+          {
+            tier: params.targetTier,
+            butlerName,
+            userName,
+            memoryContent,
+            memoryPath: this.settings.memoryFilePath,
+          },
+          { promptsDir: this.promptsDir },
+        );
+
+        const recentContext = state.messages
+          .filter((m) => m.id !== params.ackMessageId)
+          .slice(-4)
+          .map(
+            (m) =>
+              `- [${m.role}${m.triggerId ? ` trigger=${m.triggerId}` : ""}]: ${m.text.slice(0, 300)}`,
+          )
+          .join("\n");
+
+        const composedPrompt = [
+          `[Butler ${params.targetTier} Execution Brief]`,
+          params.brief,
+          recentContext ? `\n[Recent Conversation Context]\n${recentContext}` : "",
+          ``,
+          `Execution & Safety Constraints:`,
+          `- Verify facts with available tools/MCP before stating conclusions; explicitly distinguish verified facts from unverified/permission-blocked boundaries.`,
+          `- For multi-repository or multi-minute coding/optimization tasks, do a quick initial check (~30-60s), delegate heavy per-workspace edits in parallel via \`paseo_bot_delegate_task\`, and reply promptly with your findings instead of blocking this chat turn for many minutes.`,
+          `- Never ask the user to paste plaintext passwords, SSH private keys, or API keys in chat.`,
+          `- Any external email/message, payment/purchase, destructive deletion, or irreversible change MUST pause and call \`paseo_bot_request_approval\` with \`payloadPreview\`.`,
+          `- Reply directly in warm, concise butler prose (1-3 short paragraphs, bold 1-3 key dates/amounts, inline Markdown links, zero work-order prefixes).`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        const shortTitle =
+          cleanTaskTitle(params.brief).replace(/\s+/g, " ").slice(0, 26) || "管家核查";
+
+        if (this.stopped) {
+          throw new Error("Plugin stopped before launching background execution");
+        }
+
+        const launched = await this.launchTieredAgentWithFallback({
+          tier: params.targetTier,
+          cwd: targetCwd,
+          title: `${butlerName} · ${shortTitle}`,
+          systemPrompt,
+          prompt: composedPrompt,
+          images: params.attachedImages,
+          background: true,
+          labels: {
+            "paseo-bot/role": "butler-exec",
+            "paseo-bot/tier": params.targetTier,
+          },
+          providerOverride: params.providerOverride,
+        });
+
+        execHandleId = launched.handle.id;
+        const execWorkerId = `exec_${params.ackMessageId}`;
+        this.chatManagedAgentRuns.add(execHandleId);
+        const launchNowIso = new Date().toISOString();
+        await this.store
+          .mutate((draft) => {
+            const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+            if (ack) {
+              ack.agentId = execHandleId;
+              ack.links = [
+                {
+                  label: "查看实时进度",
+                  url: `paseo://agent/${execHandleId}`,
+                  kind: "agent",
+                },
+              ];
+            }
+            if (!draft.workers.some((w) => w.id === execWorkerId)) {
+              draft.workers.unshift({
+                id: execWorkerId,
+                agentId: execHandleId!,
+                workspaceId: launched.workspaceId ?? undefined,
+                title: shortTitle,
+                cwd: targetCwd,
+                provider: launched.modelUsed,
+                isolation: "local",
+                status: "running",
+                goal: params.brief.slice(0, 240),
+                notifyChiefOnFinish: false,
+                createdAt: launchNowIso,
+                updatedAt: launchNowIso,
+              });
+            }
+          })
+          .catch(() => undefined);
+        await this.broadcastSnapshot();
+
+        const execTimeoutMs = 15 * 60_000;
+        let hardTimer: ReturnType<typeof setTimeout> | null = null;
+        const runRes = await Promise.race([
+          launched.handle.waitForFinish(execTimeoutMs),
+          new Promise<never>((_, reject) => {
+            hardTimer = setTimeout(() => {
+              reject(new Error(`${params.targetTier} execution timed out after ${execTimeoutMs}ms`));
+            }, execTimeoutMs + 1_000);
+            hardTimer.unref?.();
+          }),
+        ]).finally(() => {
+          if (hardTimer) clearTimeout(hardTimer);
+        });
+        const recorded = this.scoutOutcomes.get(execHandleId);
+        this.scoutOutcomes.delete(execHandleId);
+
+        if (runRes.status === "error" || runRes.status === "timeout") {
+          throw new Error(runRes.error || `${params.targetTier} execution ended with ${runRes.status}`);
+        }
+
+        let rawReply = (recorded?.summary || runRes.lastMessage || "").trim();
+        if (!rawReply && this.paseo) {
+          const tail = await this.paseo.agents
+            .ref(execHandleId)
+            .timeline.refetch({ direction: "tail", limit: 1, wholeTurns: true })
+            .catch(() => null);
+          rawReply = extractAssistantText((tail?.entries ?? []).map((e) => e.item));
+        }
+
+        const latencyMs = Math.max(1, Date.now() - startMs);
+        const nowIso = new Date().toISOString();
+
+        // If Sentinel approval was already emitted during this turn, mark Beat 1 ack done
+        // and only append an extra chat bubble if there is distinct explanatory text.
+        const hasInlineApproval = this.store
+          .get()
+          .approvals.some((a) => a.sourceAgentId === execHandleId && a.status === "pending");
+
+        const split = rawReply
+          ? splitReplyIntoPreviewAndDetails(stripWorkOrderPrefix(rawReply))
+          : { summary: "已为你处理完毕。", details: undefined };
+        const finalDetails = recorded?.details || split.details;
+        const quickActions = (
+          recorded?.actions ?? extractSuggestedActionsFromMarkdown(rawReply)
+        ).slice(0, 2);
+        const links = extractInlineLinksFromMarkdown(`${split.summary}\n${finalDetails ?? ""}`);
+
+        await this.store.mutate((draft) => {
+          const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+          if (ack) {
+            ack.status = "done";
+            ack.links = [];
+          }
+          const execW = draft.workers.find((w) => w.id === execWorkerId);
+          if (execW) {
+            execW.status = "completed";
+            execW.updatedAt = nowIso;
+            execW.summary = split.summary.slice(0, 180);
+          }
+          if (params.targetTier === "L3") {
+            draft.routingTelemetry.l3Hits += 1;
+          } else {
+            draft.routingTelemetry.l2Hits += 1;
+          }
+          draft.routingTelemetry.lastTier = params.targetTier;
+          draft.routingTelemetry.lastModelUsed = launched.modelUsed;
+          draft.routingTelemetry.lastLatencyMs = latencyMs;
+
+          if (!hasInlineApproval || (rawReply && recorded?.level !== "approval_required")) {
+            draft.messages.push({
+              id: createShortId("msg"),
+              createdAt: nowIso,
+              role: "assistant",
+              kind: "chat",
+              text: split.summary,
+              details: finalDetails,
+              images: [],
+              links,
+              quickActions,
+              tier: params.targetTier,
+              modelUsed: launched.modelUsed,
+              latencyMs,
+              status: "done",
+              replyToMessageId: params.ackMessageId,
+              agentId: execHandleId,
+              workspaceId: launched.workspaceId ?? undefined,
+              unread: true,
+            });
+          }
+        });
+        await this.broadcastSnapshot();
+      } catch (err) {
+        const execWorkerId = `exec_${params.ackMessageId}`;
+        if (this.stopped) {
+          await this.store
+            .mutate((draft) => {
+              const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+              if (ack) {
+                ack.status = "error";
+                ack.text = "刚才插件正好重启中断了，你可以直接重发这条消息。";
+                ack.links = [];
+                ack.unread = false;
+              }
+              const execW = draft.workers.find((w) => w.id === execWorkerId);
+              if (execW && execW.status === "running") {
+                execW.status = "failed";
+                execW.updatedAt = new Date().toISOString();
+              }
+            })
+            .catch(() => undefined);
+          return;
+        }
+        const reason = err instanceof Error ? err.message : String(err);
+        const shortReason = reason.slice(0, 140);
+        const errorText = `刚才查询时出了点小状况（${shortReason}），你稍后可以再让我试一次。`;
+        const errNowIso = new Date().toISOString();
+        await this.store
+          .mutate((draft) => {
+            const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+            if (ack) {
+              ack.status = "error";
+              ack.links = [];
+              ack.unread = false;
+            }
+            const execW = draft.workers.find((w) => w.id === execWorkerId);
+            if (execW) {
+              execW.status = "failed";
+              execW.updatedAt = errNowIso;
+              execW.summary = shortReason;
+            }
+            draft.messages.push({
+              id: createShortId("msg"),
+              createdAt: errNowIso,
+              role: "assistant",
+              kind: "chat",
+              text: errorText,
+              images: [],
+              links: [],
+              quickActions: [],
+              tier: params.targetTier,
+              status: "error",
+              replyToMessageId: params.ackMessageId,
+              agentId: execHandleId,
+              unread: true,
+            });
+          })
+          .catch(() => undefined);
+        await this.broadcastSnapshot();
+      } finally {
+        if (execHandleId) {
+          this.chatManagedAgentRuns.delete(execHandleId);
+        }
+      }
+    })();
+
+    this.activeChatExecPromises.add(bgPromise);
+    void bgPromise.finally(() => {
+      this.activeChatExecPromises.delete(bgPromise);
+    });
+  }
+
+  async sendChatMessage(input: SendChatMessageInput): Promise<SendChatMessageOutput> {
+    if (this.stopped) {
+      throw new Error("刚才插件正好重启中断了，你可以直接重发这条消息。");
+    }
+    const startMs = Date.now();
+    const cleanText = (input.text ?? "").trim();
+    const attachedImages = normalizeAgentImages(input.images);
+    if (!cleanText && attachedImages.length === 0) {
+      throw new Error("Chat text or at least one image is required");
+    }
+
+    const state = await this.store.load();
+    const memoryContent = await this.store
+      .readMemory(this.settings.memoryFilePath)
+      .catch(() => "");
+    const routableCandidates =
+      cleanText && hasDirectSessionReferenceHint(cleanText) && this.paseo
+        ? await this.listRoutableAgentCandidates()
+        : [];
+
+    const decision = classifyMessageTier({
+      text: cleanText,
+      images: input.images,
+      forceTier: input.forceTier,
+      providerOverride: input.providerOverride,
+      settings: this.settings,
+      routableCandidates,
+      knownWorkspaces: this.buildKnownWorkspaces(state),
+      memoryContent,
+      recentMessages: state.messages.slice(-6),
+      replyToMessageId: input.replyToMessageId,
+    });
+
+    const safeStoredImages = (input.images ?? []).map((img) => ({
+      mimeType: img.mimeType,
+      ...(img.name ? { name: img.name } : {}),
+    }));
+    const userMsg: ChatMessage = {
+      id: createShortId("msg"),
+      createdAt: new Date().toISOString(),
+      role: "user",
+      kind: "chat",
+      text: cleanText || formatImageSummaryTag(attachedImages.length),
+      images: safeStoredImages,
+      links: [],
+      quickActions: [],
+      status: "done",
+      replyToMessageId: input.replyToMessageId,
+      unread: false,
+    };
+
+    // Branch 1: L0 Zero-Token Local Control Commands
+    if (decision.tier === "L0" && decision.reason === "local_control_command") {
+      await this.store.mutate((draft) => {
+        draft.messages.push(userMsg);
+        draft.routingTelemetry.l0Hits += 1;
+        draft.routingTelemetry.lastTier = "L0";
+        draft.routingTelemetry.lastLatencyMs = Math.max(0, Date.now() - startMs);
+      });
+
+      if (decision.localCommand === "pause") {
+        await this.setGlobalPaused(true);
+        const noteId = createShortId("msg");
+        await this.store.mutate((draft) => {
+          draft.messages.push({
+            id: noteId,
+            createdAt: new Date().toISOString(),
+            role: "assistant",
+            kind: "status_note",
+            text: "好的，已暂停全部后台自动规则；需要恢复时随时跟我说。",
+            images: [],
+            links: [],
+            quickActions: [],
+            tier: "L0",
+            latencyMs: Math.max(0, Date.now() - startMs),
+            status: "done",
+            replyToMessageId: userMsg.id,
+            unread: false,
+          });
+        });
+        await this.broadcastSnapshot();
+        return { userMessageId: userMsg.id, assistantMessageId: noteId, tier: "L0" };
+      }
+
+      if (decision.localCommand === "resume") {
+        await this.setGlobalPaused(false);
+        const noteId = createShortId("msg");
+        await this.store.mutate((draft) => {
+          draft.messages.push({
+            id: noteId,
+            createdAt: new Date().toISOString(),
+            role: "assistant",
+            kind: "status_note",
+            text: "已恢复后台自动规则，有实质变化时我会第一时间提醒你。",
+            images: [],
+            links: [],
+            quickActions: [],
+            tier: "L0",
+            latencyMs: Math.max(0, Date.now() - startMs),
+            status: "done",
+            replyToMessageId: userMsg.id,
+            unread: false,
+          });
+        });
+        await this.broadcastSnapshot();
+        return { userMessageId: userMsg.id, assistantMessageId: noteId, tier: "L0" };
+      }
+
+      const mode = decision.localCommand === "tidy_apply" ? "apply" : "preview";
+      const tidyRes = await this.tidySessions({ mode });
+      let assistantMessageId: string | undefined;
+      if (tidyRes.approvalId) {
+        const latest = this.store
+          .get()
+          .messages.find((m) => m.approvalId === tidyRes.approvalId);
+        assistantMessageId = latest?.id;
+      } else {
+        assistantMessageId = createShortId("msg");
+        await this.store.mutate((draft) => {
+          draft.messages.push({
+            id: assistantMessageId!,
+            createdAt: new Date().toISOString(),
+            role: "assistant",
+            kind: "chat",
+            text: tidyRes.summary,
+            images: [],
+            links: [],
+            quickActions: [],
+            tier: "L0",
+            latencyMs: Math.max(0, Date.now() - startMs),
+            status: tidyRes.ok ? "done" : "error",
+            replyToMessageId: userMsg.id,
+            unread: false,
+          });
+        });
+      }
+      await this.broadcastSnapshot();
+      return { userMessageId: userMsg.id, assistantMessageId, tier: "L0" };
+    }
+
+    if (!this.paseo) {
+      throw new Error("Paseo daemon connection is not initialized yet");
+    }
+
+    // Branch 2: L0 Direct Session Continuation (preserving original session model)
+    if (
+      decision.tier === "L0" &&
+      decision.reason === "direct_session_route" &&
+      decision.directSessionRoute
+    ) {
+      const route = decision.directSessionRoute;
+      const handle = this.paseo.agents.ref(route.agentId);
+      const refreshed = await handle.refresh().catch(() => null);
+      if (refreshed && !refreshed.agent.archivedAt) {
+        const actualModel = formatAgentModelPair(refreshed.agent);
+        const sessionTitle =
+          cleanTaskTitle(route.title).slice(0, 28) || route.agentId.slice(0, 8);
+        await handle.send(
+          `[来自 Paseo Bot 对话流的续接消息]\n${cleanText}`,
+          attachedImages.length > 0 ? { images: attachedImages } : undefined,
+        );
+        const wsId = route.workspaceId ?? refreshed.agent.workspaceId ?? undefined;
+        const replyMsgId = createShortId("msg");
+        const nowIso = new Date().toISOString();
+        await this.store.mutate((draft) => {
+          draft.messages.push(userMsg);
+          draft.messages.push({
+            id: replyMsgId,
+            createdAt: nowIso,
+            role: "assistant",
+            kind: "chat",
+            text: `已帮你续接到会话「**${sessionTitle}**」继续处理（[查看目标会话](paseo://agent/${route.agentId})），完成后我会同步告诉你。`,
+            images: [],
+            links: [
+              {
+                label: "查看目标会话",
+                url: `paseo://agent/${route.agentId}`,
+                kind: "agent",
+              },
+            ],
+            quickActions: [],
+            tier: "L0",
+            modelUsed: actualModel,
+            latencyMs: Math.max(0, Date.now() - startMs),
+            status: "done",
+            replyToMessageId: userMsg.id,
+            agentId: route.agentId,
+            workspaceId: wsId,
+            unread: false,
+          });
+          draft.routingTelemetry.l0Hits += 1;
+          draft.routingTelemetry.lastTier = "L0";
+          draft.routingTelemetry.lastModelUsed = actualModel;
+          draft.routingTelemetry.lastLatencyMs = Math.max(0, Date.now() - startMs);
+
+          const existingWorker = draft.workers.find((w) => w.agentId === route.agentId);
+          if (existingWorker) {
+            existingWorker.status = "running";
+            existingWorker.updatedAt = nowIso;
+          } else {
+            draft.workers.unshift({
+              id: createShortId("wish"),
+              agentId: route.agentId,
+              workspaceId: wsId,
+              title: sessionTitle,
+              cwd: route.cwd || refreshed.agent.cwd || expandHomePath(this.settings.homeCwd),
+              provider: actualModel || this.settings.execProvider,
+              isolation: "local",
+              status: "running",
+              goal: cleanText.slice(0, 1000),
+              notifyChiefOnFinish: false,
+              createdAt: nowIso,
+              updatedAt: nowIso,
+            });
+          }
+        });
+        await this.broadcastSnapshot();
+        return {
+          userMessageId: userMsg.id,
+          assistantMessageId: replyMsgId,
+          tier: "L0",
+          modelUsed: actualModel,
+          agentId: route.agentId,
+          routedSessionTitle: sessionTitle,
+        };
+      }
+    }
+
+    // Branch 3: L0 Direct Escalation to L2 / L3 (Two-Beat Handoff)
+    if (decision.tier === "L2" || decision.tier === "L3") {
+      const targetTier = decision.tier;
+      const plan = resolveTierProviderChain(
+        targetTier,
+        this.settings,
+        this.cachedProviders,
+        { providerOverride: input.providerOverride },
+      );
+      const ackMsg: ChatMessage = {
+        id: createShortId("msg"),
+        createdAt: new Date().toISOString(),
+        role: "assistant",
+        kind: "ack",
+        text:
+          decision.immediateAckText ||
+          buildImmediateAckText(targetTier, cleanText, attachedImages.length > 0),
+        images: [],
+        links: [],
+        quickActions: [],
+        tier: targetTier,
+        modelUsed: plan.chosenProvider,
+        latencyMs: Math.max(0, Date.now() - startMs),
+        status: "thinking",
+        replyToMessageId: userMsg.id,
+        unread: false,
+      };
+
+      await this.store.mutate((draft) => {
+        draft.messages.push(userMsg);
+        draft.messages.push(ackMsg);
+      });
+      await this.broadcastSnapshot();
+
+      const effectiveBrief =
+        cleanText ||
+        (attachedImages.length === 1
+          ? "请仔细查看用户发来的图片并给出清晰结论或处理结果。"
+          : `请仔细查看用户发来的 ${attachedImages.length} 张图片并给出清晰结论或处理结果。`);
+
+      this.dispatchTwoBeatExecution({
+        targetTier,
+        ackMessageId: ackMsg.id,
+        brief: effectiveBrief,
+        cwd: input.cwd,
+        providerOverride: input.providerOverride,
+        attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+      });
+
+      return {
+        userMessageId: userMsg.id,
+        ackMessageId: ackMsg.id,
+        tier: targetTier,
+        modelUsed: plan.chosenProvider,
+      };
+    }
+
+    // Branch 4: L1 Warm Fast Concierge (with 18s timeout -> L2 fallback & Two-Beat Escalation)
+    await this.store.mutate((draft) => {
+      draft.messages.push(userMsg);
+    });
+    await this.broadcastSnapshot();
+
+    const recentSlice = this.store
+      .get()
+      .messages.filter((m) => m.id !== userMsg.id)
+      .slice(-3);
+    const contextLines = recentSlice.map(
+      (m) =>
+        `- [${m.role}${m.triggerId ? ` triggerId="${m.triggerId}"` : ""}${m.triggerName ? ` (${m.triggerName})` : ""}]: ${m.text.slice(0, 260)}`,
+    );
+    const triggerHint = decision.matchedTriggerId
+      ? `\n[Context Hint] User is likely replying to proactive reminder triggerId="${decision.matchedTriggerId}"${decision.matchedTriggerName ? ` ("${decision.matchedTriggerName}")` : ""}.`
+      : "";
+    const l1TurnPrompt = [
+      contextLines.length > 0
+        ? `[Recent 3 Bubbles]\n${contextLines.join("\n")}${triggerHint}`
+        : "",
+      `[User Message]\n${cleanText}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let l1AgentIdForCleanup: string | null = null;
+    try {
+      const { handle: l1Handle, modelUsed: l1ModelUsed } = await this.ensureWarmL1Agent({
+        providerOverride: input.providerOverride,
+      });
+      l1AgentIdForCleanup = l1Handle.id;
+      this.l1Escalations.delete(l1Handle.id);
+
+      let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+      const runRes = await Promise.race([
+        l1Handle.run(l1TurnPrompt, { timeoutMs: this.l1TimeoutMs }),
+        new Promise<never>((_, reject) => {
+          timeoutTimer = setTimeout(() => {
+            reject(new Error(`L1 response exceeded ${this.l1TimeoutMs}ms timeout`));
+          }, this.l1TimeoutMs);
+          timeoutTimer.unref?.();
+        }),
+      ]).finally(() => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+      });
+
+      if (runRes.status === "error" || runRes.status === "timeout") {
+        throw new Error(runRes.error || `L1 ended in status '${runRes.status}'`);
+      }
+
+      if (this.stopped) {
+        throw new Error("Plugin stopped during L1 turn");
+      }
+
+      const l1LatencyMs = Math.max(1, Date.now() - startMs);
+      const escalation = this.l1Escalations.get(l1Handle.id);
+      this.l1Escalations.delete(l1Handle.id);
+
+      if (escalation) {
+        const ackMsg: ChatMessage = {
+          id: createShortId("msg"),
+          createdAt: new Date().toISOString(),
+          role: "assistant",
+          kind: "ack",
+          text: stripWorkOrderPrefix(escalation.ackBubble),
+          images: [],
+          links: [],
+          quickActions: [],
+          tier: "L1",
+          modelUsed: l1ModelUsed,
+          latencyMs: l1LatencyMs,
+          status: "thinking",
+          replyToMessageId: userMsg.id,
+          unread: false,
+        };
+
+        await this.store.mutate((draft) => {
+          draft.messages.push(ackMsg);
+          draft.routingTelemetry.l1Hits += 1;
+          draft.routingTelemetry.lastTier = "L1";
+          draft.routingTelemetry.lastModelUsed = l1ModelUsed;
+          draft.routingTelemetry.lastLatencyMs = l1LatencyMs;
+        });
+        await this.broadcastSnapshot();
+
+        this.dispatchTwoBeatExecution({
+          targetTier: escalation.targetTier,
+          ackMessageId: ackMsg.id,
+          brief: escalation.handoffBrief || cleanText,
+          cwd: escalation.cwd || input.cwd,
+          providerOverride: input.providerOverride,
+        });
+
+        return {
+          userMessageId: userMsg.id,
+          ackMessageId: ackMsg.id,
+          tier: "L1",
+          modelUsed: l1ModelUsed,
+          escalatedTo: escalation.targetTier,
+          agentId: l1Handle.id,
+        };
+      }
+
+      let replyText = (runRes.lastMessage ?? "").trim();
+      if (!replyText) {
+        const tail = await l1Handle.timeline
+          .refetch({ direction: "tail", limit: 1, wholeTurns: true })
+          .catch(() => null);
+        replyText = extractAssistantText((tail?.entries ?? []).map((e) => e.item));
+      }
+      replyText = stripWorkOrderPrefix(replyText) || "好的，我已经记下了。";
+
+      // ISS-001 safety net: if user explicitly requested a rename in this L1 turn, ensure profile state stays synced
+      if (decision.reason === "memory_or_mute_reply") {
+        await this.syncProfilePreferencesFromMemoryText(cleanText);
+      }
+
+      const replyMsg: ChatMessage = {
+        id: createShortId("msg"),
+        createdAt: new Date().toISOString(),
+        role: "assistant",
+        kind: "chat",
+        text: replyText,
+        images: [],
+        links: extractInlineLinksFromMarkdown(replyText),
+        quickActions: [],
+        tier: "L1",
+        modelUsed: l1ModelUsed,
+        latencyMs: l1LatencyMs,
+        status: "done",
+        replyToMessageId: userMsg.id,
+        agentId: l1Handle.id,
+        unread: false,
+      };
+
+      await this.store.mutate((draft) => {
+        draft.messages.push(replyMsg);
+        draft.routingTelemetry.l1Hits += 1;
+        draft.routingTelemetry.lastTier = "L1";
+        draft.routingTelemetry.lastModelUsed = l1ModelUsed;
+        draft.routingTelemetry.lastLatencyMs = l1LatencyMs;
+      });
+      await this.broadcastSnapshot();
+
+      return {
+        userMessageId: userMsg.id,
+        assistantMessageId: replyMsg.id,
+        tier: "L1",
+        modelUsed: l1ModelUsed,
+        agentId: l1Handle.id,
+      };
+    } catch {
+      if (this.stopped) {
+        const interruptedMsg: ChatMessage = {
+          id: createShortId("msg"),
+          createdAt: new Date().toISOString(),
+          role: "assistant",
+          kind: "chat",
+          text: "刚才插件正好重启中断了，你可以直接重发这条消息。",
+          images: [],
+          links: [],
+          quickActions: [],
+          tier: "L1",
+          status: "error",
+          replyToMessageId: userMsg.id,
+          unread: false,
+        };
+        await this.store
+          .mutate((draft) => {
+            draft.messages.push(interruptedMsg);
+          })
+          .catch(() => undefined);
+        return {
+          userMessageId: userMsg.id,
+          assistantMessageId: interruptedMsg.id,
+          tier: "L1",
+        };
+      }
+
+      // L1 timeout (>18s) or provider failure -> reset l1AgentId and seamlessly fall back to L2
+      if (l1AgentIdForCleanup && this.paseo) {
+        void this.paseo.agents.ref(l1AgentIdForCleanup).archive().catch(() => undefined);
+      }
+      const fallbackPlan = resolveTierProviderChain(
+        "L2",
+        this.settings,
+        this.cachedProviders,
+      );
+      const ackMsg: ChatMessage = {
+        id: createShortId("msg"),
+        createdAt: new Date().toISOString(),
+        role: "assistant",
+        kind: "ack",
+        text: buildImmediateAckText("L2", cleanText, false),
+        images: [],
+        links: [],
+        quickActions: [],
+        tier: "L2",
+        modelUsed: fallbackPlan.chosenProvider,
+        status: "thinking",
+        replyToMessageId: userMsg.id,
+        unread: false,
+      };
+
+      await this.store.mutate((draft) => {
+        if (l1AgentIdForCleanup && draft.l1AgentId === l1AgentIdForCleanup) {
+          draft.l1AgentId = null;
+        } else if (!l1AgentIdForCleanup) {
+          draft.l1AgentId = null;
+        }
+        draft.routingTelemetry.fallbackCount += 1;
+        draft.messages.push(ackMsg);
+      });
+      await this.broadcastSnapshot();
+
+      this.dispatchTwoBeatExecution({
+        targetTier: "L2",
+        ackMessageId: ackMsg.id,
+        brief: cleanText,
+        cwd: input.cwd,
+      });
+
+      return {
+        userMessageId: userMsg.id,
+        ackMessageId: ackMsg.id,
+        tier: "L2",
+        escalatedTo: "L2",
+        modelUsed: fallbackPlan.chosenProvider,
+      };
+    }
+  }
+
   async delegateTask(input: {
     title: string;
     cwd: string;
@@ -3099,50 +4617,30 @@ export class ProactiveEngine {
     const isolation = input.isolation ?? "local";
     const workerId = createShortId("wrk");
     const preferredWorkerModeId = input.modeId?.trim() || this.settings.defaultWorkerModeId;
-    const [launch, workspaceHandle] = await Promise.all([
-      this.resolveLaunchConfig(
-        input.provider?.trim() || this.settings.defaultWorkerProvider,
-        preferredWorkerModeId,
-        targetCwd,
-      ),
-      isolation === "worktree"
-        ? this.paseo.workspaces.create({
-            title: input.title,
-            source: {
-              kind: "worktree",
-              cwd: targetCwd,
-              action: "branch-off",
-            },
-          })
-        : this.paseo.workspaces.open(targetCwd),
-    ]);
-
-    const agentHandle = await this.createAgentWithModeFallback(
-      workspaceHandle,
-      {
-        config: {
-          provider: launch.provider,
-          modeId: launch.modeId,
-        },
-        title: `Bot Worker · ${input.title}`,
-        prompt: input.prompt,
-        ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
-        labels: {
-          "paseo-bot/role": "worker",
-          "paseo-bot/worker-id": workerId,
-        },
+    const launched = await this.launchTieredAgentWithFallback({
+      tier: "L2",
+      cwd: targetCwd,
+      title: `Bot Worker · ${input.title}`,
+      prompt: input.prompt,
+      images: input.images,
+      labels: {
+        "paseo-bot/role": "worker",
+        "paseo-bot/worker-id": workerId,
       },
-      { preferredModeId: preferredWorkerModeId, cwd: targetCwd },
-    );
+      providerOverride: input.provider?.trim() || this.settings.defaultWorkerProvider,
+      preferredModeIdOverride: preferredWorkerModeId,
+      isDelegatedWorker: true,
+      useWorktree: isolation === "worktree",
+    });
 
     const nowIso = new Date().toISOString();
     const record: DelegatedWorker = {
       id: workerId,
-      agentId: agentHandle.id,
-      workspaceId: agentHandle.workspaceId ?? workspaceHandle.id,
+      agentId: launched.handle.id,
+      workspaceId: launched.workspaceId ?? undefined,
       title: input.title,
       cwd: targetCwd,
-      provider: launch.provider,
+      provider: launched.modelUsed,
       isolation,
       status: "running",
       goal: input.prompt.slice(0, 1000),
@@ -3434,6 +4932,9 @@ export class ProactiveEngine {
     if (!event.manual && trigger.lastTriggeredAt && trigger.cooldownSec > 0) {
       const elapsedSec = (Date.now() - Date.parse(trigger.lastTriggeredAt)) / 1000;
       if (elapsedSec < trigger.cooldownSec) {
+        await this.store.mutateDeferred((draft) => {
+          draft.routingTelemetry.l0Hits += 1;
+        }, 15_000);
         return { ok: false, message: `In cooldown (${Math.ceil(trigger.cooldownSec - elapsedSec)}s left)` };
       }
     }
@@ -3466,6 +4967,9 @@ export class ProactiveEngine {
         triggerId: trigger.id,
         triggerName: trigger.name,
         notifyDesktop: false,
+        beforeMutate: (draft) => {
+          draft.routingTelemetry.l0Hits += 1;
+        },
       });
       return { ok: false, message: "Hourly wake budget exceeded" };
     }
@@ -3506,6 +5010,14 @@ export class ProactiveEngine {
   ): Promise<void> {
     if (!this.paseo) return;
 
+    const currentState = this.store.get();
+    const butlerName = this.getEffectiveButlerName(currentState);
+    const userName = this.getEffectiveUserName(currentState);
+    const bubbleStyleGuide = await buildProactiveScoutPromptGuidance(
+      { butlerName, userName },
+      { promptsDir: this.promptsDir },
+    );
+
     const noiseSection =
       trigger.noiseRules && trigger.noiseRules.length > 0
         ? [
@@ -3534,7 +5046,9 @@ export class ProactiveEngine {
         ? `1. GOVERNANCE = require_approval: You may inspect/read freely, retrieve facts, and prepare drafts, but DO NOT execute external messages, emails, purchases, or destructive edits directly. Instead, call \`paseo_bot_request_approval\` with \`payloadPreview\` (exact draft/command/diff) and \`followUpPrompt\`.`
         : `1. Respect the mission's governance (${trigger.governance}). For sensitive irreversible external actions, call \`paseo_bot_request_approval\` and attach \`payloadPreview\`.`,
       `2. If nothing meaningful requires the user's attention, call \`paseo_bot_report_outcome\` with \`level: "silent"\` and stop immediately.`,
-      `3. If there is a meaningful result or alert, call \`paseo_bot_report_outcome\` with \`level: "notify"\`, a crisp conclusion-first \`summary\`, optional \`details\` (deeper Layer-2 evidence), and 1-2 helpful \`actions\` (one-tap Poke follow-up buttons).`,
+      `3. If there is a meaningful result or alert, call \`paseo_bot_report_outcome\` with \`level: "notify"\` following the short-bubble butler style guide below.`,
+      ``,
+      bubbleStyleGuide,
     ].join("\n");
 
     try {
@@ -3559,30 +5073,37 @@ export class ProactiveEngine {
         : (await pathExists(expandedHome))
           ? expandedHome
           : os.homedir();
-      const workspace = await this.paseo.workspaces.open(targetCwd);
-      const launch = await this.resolveLaunchConfig(
-        trigger.providerOverride || this.settings.scoutProvider,
-        this.settings.scoutModeId,
-        targetCwd,
-      );
 
-      const helper = await this.createAgentWithModeFallback(
-        workspace,
-        {
-          config: {
-            provider: launch.provider,
-            modeId: launch.modeId,
-          },
-          title: `Scout · ${trigger.name}`,
-          prompt: composedPrompt,
-          background: true,
-          labels: {
-            "paseo-bot/role": "scout",
-            "paseo-bot/trigger-id": trigger.id,
-          },
+      const useLightL1 =
+        trigger.kind === "self_wake" &&
+        !trigger.providerOverride &&
+        !isHeavySelfWakePrompt(trigger.prompt);
+      const scoutTier: "L1" | "L2" = useLightL1 ? "L1" : "L2";
+
+      const launched = await this.launchTieredAgentWithFallback({
+        tier: scoutTier,
+        cwd: targetCwd,
+        title: `Scout · ${trigger.name}`,
+        systemPrompt: bubbleStyleGuide,
+        prompt: composedPrompt,
+        background: true,
+        labels: {
+          "paseo-bot/role": "scout",
+          "paseo-bot/trigger-id": trigger.id,
+          "paseo-bot/tier": scoutTier,
         },
-        { preferredModeId: this.settings.scoutModeId, cwd: targetCwd },
-      );
+        providerOverride: useLightL1
+          ? undefined
+          : trigger.providerOverride || this.settings.scoutProvider,
+        preferredModeIdOverride: this.settings.scoutModeId,
+      });
+      const helper = launched.handle;
+      await this.store.mutateDeferred((draft) => {
+        if (scoutTier === "L1") draft.routingTelemetry.l1Hits += 1;
+        else draft.routingTelemetry.l2Hits += 1;
+        draft.routingTelemetry.lastTier = scoutTier;
+        draft.routingTelemetry.lastModelUsed = launched.modelUsed;
+      }, 10_000);
       this.scoutTriggerMap.set(helper.id, {
         triggerId: trigger.id,
         triggerName: trigger.name,
@@ -4009,6 +5530,9 @@ export class ProactiveEngine {
         .get()
         .workers.find((w) => w.agentId === agent.id && w.status !== "archived");
       if (!worker || worker.status === "running") return;
+      if (worker.status === "completed") {
+        this.repeatInteractiveTurnAgents.add(agent.id);
+      }
       await this.store.mutate((draft) => {
         const found = draft.workers.find((w) => w.id === worker.id);
         if (found) {
@@ -4025,6 +5549,8 @@ export class ProactiveEngine {
         this.attachPaseo(paseo);
         const alreadyReportedViaTool = this.reportedTurnAgents.has(agent.id);
         this.reportedTurnAgents.delete(agent.id);
+        const wasRepeatTurnInMemory = this.repeatInteractiveTurnAgents.has(agent.id);
+        this.repeatInteractiveTurnAgents.delete(agent.id);
         if (agent.background) return;
         if (outcome.kind === "completed") {
           void this.maybeAutoRenameSessionAfterTurn(agent, turnId, paseo);
@@ -4035,11 +5561,14 @@ export class ProactiveEngine {
           .workers.find((w) => w.agentId === agent.id && w.status !== "archived");
         if (!worker) return;
 
+        const refHandle = paseo.agents.ref(agent.id);
         let latestReply = "";
         try {
-          const page = await paseo.agents
-            .ref(agent.id)
-            .timeline.refetch({ direction: "tail", limit: 1, wholeTurns: true });
+          const page = await refHandle.timeline.refetch({
+            direction: "tail",
+            limit: 1,
+            wholeTurns: true,
+          });
           const matching = turnId
             ? page.entries.filter((e) => e.turnId === turnId)
             : page.entries;
@@ -4048,34 +5577,87 @@ export class ProactiveEngine {
           // Ignore timeline read error
         }
 
+        const extractLabels = (obj: unknown): Record<string, string> | undefined => {
+          if (!obj || typeof obj !== "object") return undefined;
+          const raw = (obj as Record<string, unknown>).labels;
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+          return raw as Record<string, string>;
+        };
+        let agentLabels =
+          extractLabels(agent) ?? extractLabels(refHandle.current?.());
+        if (!agentLabels) {
+          const refreshed = await refHandle.refresh().catch(() => null);
+          agentLabels = extractLabels(refreshed?.agent);
+        }
+
         const nextStatus: DelegatedWorker["status"] =
           outcome.kind === "failed" ? "failed" : "completed";
+        const effectiveTitle =
+          (typeof agent.title === "string" && agent.title.trim()) || worker.title;
+        const cleanTitle = cleanTaskTitle(effectiveTitle);
+        const isRepeatInteractiveTurn =
+          wasRepeatTurnInMemory ||
+          (worker.id.startsWith("wish_") && Boolean(worker.summary));
 
-        const split =
-          outcome.kind === "failed"
-            ? { summary: `执行出错：${outcome.error.message}` }
-            : splitReplyIntoPreviewAndDetails(latestReply || "处理完成。");
-
-        const cleanTitle = cleanTaskTitle(worker.title);
         let chiefId: string | null = null;
 
         if (alreadyReportedViaTool && outcome.kind !== "failed") {
           // Tool already published a rich outcome card; only finalize worker status
+          const shortSummary =
+            buildConclusionSummary(latestReply || worker.summary || cleanTitle, cleanTitle)
+              .text;
           await this.store.mutate((draft) => {
             const found = draft.workers.find((w) => w.id === worker.id);
             if (found) {
               found.status = nextStatus;
               found.updatedAt = new Date().toISOString();
-              found.summary = split.summary;
+              found.summary = shortSummary;
             }
             chiefId = draft.chiefAgentId;
           });
           await this.broadcastSnapshot();
         } else {
+          const streamDecision = evaluateWorkerTurnForStream({
+            text: latestReply,
+            title: effectiveTitle,
+            outcomeKind: outcome.kind === "failed" ? "failed" : "completed",
+            labels: agentLabels,
+            isRepeatInteractiveTurn,
+            workerId: worker.id,
+          });
+
+          if (!streamDecision.shouldSync) {
+            // ADR-004: silently finalize worker status without polluting feed, messages, or desktop notifications
+            const nowIso = new Date().toISOString();
+            await this.store.mutate((draft) => {
+              draft.routingTelemetry.l0Hits += 1;
+              const found = draft.workers.find((w) => w.id === worker.id);
+              if (found) {
+                found.status = nextStatus;
+                found.updatedAt = nowIso;
+                found.summary =
+                  found.summary ||
+                  (latestReply.trim().slice(0, 160) || cleanTitle || "completed");
+              }
+              for (const f of draft.feed) {
+                if (f.agentId === worker.agentId && f.inProgress) {
+                  f.inProgress = false;
+                }
+              }
+            });
+            await this.broadcastSnapshot();
+            return;
+          }
+
+          const condensed =
+            outcome.kind === "failed"
+              ? { text: `执行出错：${outcome.error.message}` }
+              : buildConclusionSummary(latestReply, cleanTitle, 220);
           const autoActions =
             outcome.kind === "completed"
               ? extractSuggestedActionsFromMarkdown(latestReply)
               : [];
+
           await this.upsertAgentFeedCard({
             agentId: worker.agentId,
             workspaceId: worker.workspaceId,
@@ -4083,9 +5665,9 @@ export class ProactiveEngine {
             title:
               outcome.kind === "failed"
                 ? `执行出错：${cleanTitle}`
-                : `已完成：${cleanTitle}`,
-            summary: split.summary,
-            details: split.details,
+                : cleanTitle || "任务进展",
+            summary: condensed.text,
+            details: condensed.details,
             actions: autoActions,
             notifyDesktop: true,
             appendChiefTimeline: true,
@@ -4094,7 +5676,7 @@ export class ProactiveEngine {
               if (found) {
                 found.status = nextStatus;
                 found.updatedAt = new Date().toISOString();
-                found.summary = split.summary;
+                found.summary = condensed.text;
               }
               chiefId = draft.chiefAgentId;
             },
@@ -4110,7 +5692,7 @@ export class ProactiveEngine {
                 `Workspace: ${worker.cwd}`,
                 `Status: ${nextStatus}`,
                 `Result Summary:`,
-                (split.details || split.summary).slice(0, 4000),
+                (latestReply || cleanTitle).slice(0, 4000),
                 ``,
                 `Review whether the user's goal is now satisfied or if another step is needed.`,
               ].join("\n"),
@@ -4206,10 +5788,11 @@ export class ProactiveEngine {
       this.cachedRoutableAt = 0;
       const current = this.store.get();
       const matchesChief = current.chiefAgentId === agent.id;
+      const matchesL1 = current.l1AgentId === agent.id;
       const matchesWorker = current.workers.some(
         (w) => w.agentId === agent.id && w.status !== "archived",
       );
-      if (!matchesChief && !matchesWorker) return;
+      if (!matchesChief && !matchesL1 && !matchesWorker) return;
 
       let changed = false;
       const nowIso = new Date().toISOString();
@@ -4217,6 +5800,10 @@ export class ProactiveEngine {
         if (draft.chiefAgentId === agent.id) {
           draft.chiefAgentId = null;
           draft.chiefWorkspaceId = null;
+          changed = true;
+        }
+        if (draft.l1AgentId === agent.id) {
+          draft.l1AgentId = null;
           changed = true;
         }
         const worker = draft.workers.find((w) => w.agentId === agent.id);

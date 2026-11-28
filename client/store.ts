@@ -2,9 +2,13 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import type {
   BotSnapshot,
   BotSummary,
+  ChatMessage,
+  ChatMessageImage,
   FeedFeedback,
   FeedItem,
   KnownWorkspace,
+  RoutingTelemetry,
+  TierModels,
 } from "../shared/contracts";
 
 export const MAX_DRAFT_IMAGES = 6;
@@ -20,6 +24,20 @@ export interface DraftImageAttachment {
 
 export type BotConsoleTab = "inbox" | "approvals" | "missions" | "workers";
 export type BotInboxFilterMode = "all" | "unread" | "running" | "attention";
+export type ManagementDrawerSection =
+  | "rules"
+  | "approvals"
+  | "memory"
+  | "workers"
+  | "routing";
+
+const DEFAULT_ROUTING_TELEMETRY: RoutingTelemetry = {
+  l0Hits: 0,
+  l1Hits: 0,
+  l2Hits: 0,
+  l3Hits: 0,
+  fallbackCount: 0,
+};
 
 const EMPTY_SNAPSHOT: BotSnapshot = {
   chiefAgentId: null,
@@ -41,12 +59,19 @@ const EMPTY_SNAPSHOT: BotSnapshot = {
   knownWorkspaces: [],
   memoryContent: "",
   memoryPath: "",
+  butlerName: "Paseo Bot",
+  userName: "",
+  messages: [],
+  routingTelemetry: DEFAULT_ROUTING_TELEMETRY,
 };
 
 let currentSnapshot: BotSnapshot = EMPTY_SNAPSHOT;
 let requestedTab: BotConsoleTab | null = null;
 let requestedInboxFilter: BotInboxFilterMode | null = null;
+let requestedDrawerSection: ManagementDrawerSection | null = null;
 let selectedConsoleProvider: string | null = null;
+let deepThinkEnabled = false;
+let pendingChatSends = 0;
 let wishDraftText = "";
 let wishDraftImages: DraftImageAttachment[] = [];
 
@@ -56,9 +81,53 @@ interface PendingOptimisticWish {
   confirmedFeedId?: string;
 }
 
+interface PendingOptimisticChatMessage {
+  item: ChatMessage;
+  createdAtMs: number;
+  confirmedMessageId?: string;
+}
+
 const OPTIMISTIC_WISH_TTL_MS = 30_000;
+const OPTIMISTIC_CHAT_TTL_MS = 45_000;
+const MAX_LOCAL_IMAGE_PREVIEW_CACHE = 32;
+
 let optimisticWishSeq = 0;
+let optimisticChatSeq = 0;
 const pendingOptimisticWishes = new Map<string, PendingOptimisticWish>();
+const pendingOptimisticChatMessages = new Map<string, PendingOptimisticChatMessage>();
+const localMessageImagePreviews = new Map<string, ChatMessageImage[]>();
+
+function rememberLocalMessagePreviews(
+  messageId: string,
+  images: readonly ChatMessageImage[],
+): void {
+  if (!messageId || images.length === 0) return;
+  if (!images.some((img) => Boolean(img.previewUri))) return;
+  localMessageImagePreviews.delete(messageId);
+  localMessageImagePreviews.set(messageId, [...images]);
+  while (localMessageImagePreviews.size > MAX_LOCAL_IMAGE_PREVIEW_CACHE) {
+    const oldestKey = localMessageImagePreviews.keys().next().value;
+    if (!oldestKey) break;
+    localMessageImagePreviews.delete(oldestKey);
+  }
+}
+
+function hydrateLocalMessageImages(messages: ChatMessage[]): ChatMessage[] {
+  if (localMessageImagePreviews.size === 0 || messages.length === 0) return messages;
+  let mutated = false;
+  const next = messages.map((msg) => {
+    const cached = localMessageImagePreviews.get(msg.id);
+    if (!cached || cached.length === 0) return msg;
+    const alreadyHasPreview = msg.images.some((img) => Boolean(img.previewUri));
+    if (alreadyHasPreview) return msg;
+    mutated = true;
+    return {
+      ...msg,
+      images: cached,
+    };
+  });
+  return mutated ? next : messages;
+}
 
 function mergePendingOptimisticFeed(serverFeed: FeedItem[]): FeedItem[] {
   if (pendingOptimisticWishes.size === 0) return serverFeed;
@@ -88,8 +157,46 @@ function mergePendingOptimisticFeed(serverFeed: FeedItem[]): FeedItem[] {
   return [...stillPending, ...serverFeed];
 }
 
+function mergePendingOptimisticChatMessages(serverMessages: ChatMessage[]): ChatMessage[] {
+  const hydrated = hydrateLocalMessageImages(serverMessages);
+  if (pendingOptimisticChatMessages.size === 0) return hydrated;
+  const now = Date.now();
+  const stillPending: ChatMessage[] = [];
+
+  for (const [optId, entry] of pendingOptimisticChatMessages) {
+    const matchedServerMsg = hydrated.find((m) => {
+      if (entry.confirmedMessageId && m.id === entry.confirmedMessageId) {
+        return true;
+      }
+      if (!entry.confirmedMessageId && m.role === "user" && m.text === entry.item.text) {
+        const ts = Date.parse(m.createdAt);
+        return Number.isFinite(ts) && ts >= entry.createdAtMs - 10_000;
+      }
+      return false;
+    });
+
+    const expired = now - entry.createdAtMs > OPTIMISTIC_CHAT_TTL_MS;
+    if (matchedServerMsg) {
+      if (entry.item.images.length > 0) {
+        rememberLocalMessagePreviews(matchedServerMsg.id, entry.item.images);
+      }
+      pendingOptimisticChatMessages.delete(optId);
+    } else if (expired) {
+      pendingOptimisticChatMessages.delete(optId);
+    } else {
+      stillPending.push(entry.item);
+    }
+  }
+
+  const rehydrated = hydrateLocalMessageImages(hydrated);
+  if (stillPending.length === 0) return rehydrated;
+  return [...rehydrated, ...stillPending];
+}
+
 const listeners = new Set<() => void>();
 const providerListeners = new Set<() => void>();
+const deepThinkListeners = new Set<() => void>();
+const chatSendListeners = new Set<() => void>();
 const wishDraftListeners = new Set<() => void>();
 const wishDraftImagesListeners = new Set<() => void>();
 
@@ -226,6 +333,15 @@ function reconcileWorkspaces(prev: KnownWorkspace[], next: KnownWorkspace[]): Kn
   return next;
 }
 
+function reconcileOptionalRecord<T extends Record<string, unknown> | undefined>(
+  prev: T,
+  next: T,
+): T {
+  if (Object.is(prev, next)) return prev;
+  if (!prev || !next) return next;
+  return shallowEqualPlainObject(prev, next) ? prev : next;
+}
+
 function updateSidebarCacheAndEmit(): void {
   const nextKey = `${currentSnapshot.pendingApprovalCount}:${currentSnapshot.unreadCount}:${currentSnapshot.runningWorkerCount}:${currentSnapshot.globalPaused ? 1 : 0}`;
   if (nextKey !== cachedSidebarKey) {
@@ -312,6 +428,22 @@ export function setLiveBotSnapshot(next: BotSnapshot): void {
     prev.knownWorkspaces ?? [],
     next.knownWorkspaces ?? [],
   );
+  const messages = reconcileById(
+    prev.messages ?? [],
+    mergePendingOptimisticChatMessages(next.messages ?? []),
+  );
+  const nextButlerName = next.butlerName ?? prev.butlerName ?? "Paseo Bot";
+  const nextUserName = next.userName ?? prev.userName ?? "";
+  const routingTelemetry = reconcileOptionalRecord(
+    (prev.routingTelemetry ?? DEFAULT_ROUTING_TELEMETRY) as unknown as Record<string, unknown>,
+    (next.routingTelemetry ??
+      prev.routingTelemetry ??
+      DEFAULT_ROUTING_TELEMETRY) as unknown as Record<string, unknown>,
+  ) as unknown as RoutingTelemetry;
+  const tierModels = reconcileOptionalRecord(
+    prev.tierModels as unknown as Record<string, unknown> | undefined,
+    next.tierModels as unknown as Record<string, unknown> | undefined,
+  ) as unknown as TierModels | undefined;
 
   const unchanged =
     prev.chiefAgentId === next.chiefAgentId &&
@@ -326,18 +458,25 @@ export function setLiveBotSnapshot(next: BotSnapshot): void {
     prev.totalSilentChecks === next.totalSilentChecks &&
     prev.memoryContent === next.memoryContent &&
     prev.memoryPath === next.memoryPath &&
+    prev.butlerName === nextButlerName &&
+    prev.userName === nextUserName &&
     triggers === prev.triggers &&
     nativeSchedules === prev.nativeSchedules &&
     feed === prev.feed &&
     approvals === prev.approvals &&
     workers === prev.workers &&
     routineSuggestions === prev.routineSuggestions &&
-    knownWorkspaces === prev.knownWorkspaces;
+    knownWorkspaces === prev.knownWorkspaces &&
+    messages === (prev.messages ?? []) &&
+    routingTelemetry === prev.routingTelemetry &&
+    tierModels === prev.tierModels;
 
   if (unchanged) return;
 
   currentSnapshot = {
     ...next,
+    butlerName: nextButlerName,
+    userName: nextUserName,
     triggers,
     nativeSchedules,
     feed,
@@ -345,6 +484,9 @@ export function setLiveBotSnapshot(next: BotSnapshot): void {
     workers,
     routineSuggestions,
     knownWorkspaces,
+    messages,
+    routingTelemetry,
+    tierModels,
   };
   updateSidebarCacheAndEmit();
 }
@@ -374,17 +516,22 @@ export function isFeedItemNeedsAttention(
   }
   const actions = item.actions ?? [];
   if (actions.length > 0) {
-    // Once any action button on the card has been executed (single action or picking one of
-    // mutually exclusive options), the card is handled and leaves the "Actionable" filter.
     return !actions.some((a) => Boolean(a.executedAt));
   }
   return false;
 }
 
 function recomputeDerivedSnapshot(next: BotSnapshot): BotSnapshot {
+  const msgs = next.messages ?? [];
   let unreadCount = 0;
-  for (const f of next.feed) {
-    if (f.unread && f.level !== "silent") unreadCount += 1;
+  if (msgs.length > 0) {
+    for (const m of msgs) {
+      if (m.unread && m.role !== "user") unreadCount += 1;
+    }
+  } else {
+    for (const f of next.feed) {
+      if (f.unread && f.level !== "silent") unreadCount += 1;
+    }
   }
   let pendingApprovalCount = 0;
   for (const a of next.approvals) {
@@ -400,6 +547,148 @@ function recomputeDerivedSnapshot(next: BotSnapshot): BotSnapshot {
     pendingApprovalCount,
     runningWorkerCount,
   };
+}
+
+export function optimisticAddChatMessage(
+  text: string,
+  images: ReadonlyArray<ChatMessageImage> = [],
+  replyToMessageId?: string,
+): string {
+  const clean = text.trim();
+  const fallbackLabel =
+    images.length <= 0
+      ? ""
+      : images.length === 1
+        ? "[附 1 张图片]"
+        : `[附 ${images.length} 张图片]`;
+  const nowMs = Date.now();
+  optimisticChatSeq += 1;
+  const id = `opt_chat_${nowMs}_${optimisticChatSeq}`;
+  const item: ChatMessage = {
+    id,
+    createdAt: new Date(nowMs).toISOString(),
+    role: "user",
+    kind: "chat",
+    text: clean || fallbackLabel,
+    images: [...images],
+    links: [],
+    quickActions: [],
+    status: "sending",
+    replyToMessageId,
+    unread: false,
+  };
+  pendingOptimisticChatMessages.set(id, { item, createdAtMs: nowMs });
+  const prev = currentSnapshot;
+  const prevMessages = prev.messages ?? [];
+  currentSnapshot = {
+    ...prev,
+    messages: [...prevMessages, item],
+  };
+  updateSidebarCacheAndEmit();
+  return id;
+}
+
+export function confirmOptimisticChatMessage(
+  optimisticId: string,
+  serverUserMessageId?: string,
+): void {
+  const entry = pendingOptimisticChatMessages.get(optimisticId);
+  if (!entry) return;
+  if (serverUserMessageId) {
+    entry.confirmedMessageId = serverUserMessageId;
+    if (entry.item.images.length > 0) {
+      rememberLocalMessagePreviews(serverUserMessageId, entry.item.images);
+    }
+    const currMsgs = currentSnapshot.messages ?? [];
+    if (currMsgs.some((m) => m.id === serverUserMessageId)) {
+      pendingOptimisticChatMessages.delete(optimisticId);
+      const filtered = hydrateLocalMessageImages(
+        currMsgs.filter((m) => m.id !== optimisticId),
+      );
+      currentSnapshot = recomputeDerivedSnapshot({
+        ...currentSnapshot,
+        messages: filtered,
+      });
+      updateSidebarCacheAndEmit();
+      return;
+    }
+  }
+  // Server snapshot not yet pushed over subscription: mark optimistic bubble sent cleanly
+  if (entry.item.status !== "done") {
+    const updatedItem: ChatMessage = { ...entry.item, status: "done" };
+    entry.item = updatedItem;
+    const currMsgs = currentSnapshot.messages ?? [];
+    if (currMsgs.some((m) => m.id === optimisticId)) {
+      currentSnapshot = {
+        ...currentSnapshot,
+        messages: currMsgs.map((m) => (m.id === optimisticId ? updatedItem : m)),
+      };
+      updateSidebarCacheAndEmit();
+    }
+  }
+}
+
+export function rollbackOptimisticChatMessage(optimisticId: string): void {
+  pendingOptimisticChatMessages.delete(optimisticId);
+  const prev = currentSnapshot;
+  const currMsgs = prev.messages ?? [];
+  if (!currMsgs.some((m) => m.id === optimisticId)) return;
+  const nextMessages = currMsgs.filter((m) => m.id !== optimisticId);
+  currentSnapshot = recomputeDerivedSnapshot({
+    ...prev,
+    messages: nextMessages,
+  });
+  updateSidebarCacheAndEmit();
+}
+
+export function optimisticMarkMessagesRead(upToMessageId?: string): void {
+  const prev = currentSnapshot;
+  const currMsgs = prev.messages ?? [];
+  if (currMsgs.length === 0 && prev.unreadCount === 0) return;
+
+  const cleanUpTo = upToMessageId?.trim();
+  let changed = false;
+  let stopReached = false;
+  const nextMessages = currMsgs.map((m) => {
+    if (stopReached) return m;
+    const next = m.unread ? ((changed = true), { ...m, unread: false }) : m;
+    if (cleanUpTo && m.id === cleanUpTo) {
+      stopReached = true;
+    }
+    return next;
+  });
+
+  if (!changed && prev.unreadCount === 0) return;
+  const nextFeed = !cleanUpTo
+    ? prev.feed.map((f) => (f.unread ? { ...f, unread: false } : f))
+    : prev.feed;
+
+  currentSnapshot = recomputeDerivedSnapshot({
+    ...prev,
+    messages: changed ? nextMessages : currMsgs,
+    feed: nextFeed,
+  });
+  updateSidebarCacheAndEmit();
+}
+
+export function optimisticUpdateButlerProfile(input: {
+  butlerName?: string;
+  userName?: string;
+}): void {
+  const prev = currentSnapshot;
+  const nextButler =
+    input.butlerName !== undefined
+      ? input.butlerName.trim() || "Paseo Bot"
+      : (prev.butlerName ?? "Paseo Bot");
+  const nextUser =
+    input.userName !== undefined ? input.userName.trim() : (prev.userName ?? "");
+  if (prev.butlerName === nextButler && prev.userName === nextUser) return;
+  currentSnapshot = {
+    ...prev,
+    butlerName: nextButler,
+    userName: nextUser,
+  };
+  updateSidebarCacheAndEmit();
 }
 
 export function optimisticAddWishFeed(wishText: string, imageCount = 0): string {
@@ -687,10 +976,18 @@ export function optimisticResolveApproval(
           : f,
       )
     : prev.feed;
+  const currMsgs = prev.messages ?? [];
+  const nextMessages =
+    currMsgs.length > 0
+      ? currMsgs.map((m) =>
+          m.approvalId === id && m.unread ? { ...m, unread: false } : m,
+        )
+      : currMsgs;
   currentSnapshot = recomputeDerivedSnapshot({
     ...prev,
     approvals: nextApprovals,
     feed: nextFeed,
+    messages: nextMessages,
   });
   updateSidebarCacheAndEmit();
 }
@@ -699,11 +996,29 @@ export function getLiveBotSnapshot(): BotSnapshot {
   return currentSnapshot;
 }
 
+export function setRequestedDrawerSection(section: ManagementDrawerSection | null): void {
+  requestedDrawerSection = section;
+}
+
+export function consumeRequestedDrawerSection(): ManagementDrawerSection | null {
+  const section = requestedDrawerSection;
+  requestedDrawerSection = null;
+  return section;
+}
+
 export function setRequestedConsoleTab(tab: BotConsoleTab | null): void {
   if (tab === "approvals") {
     requestedTab = "inbox";
     requestedInboxFilter = "attention";
+    requestedDrawerSection = "approvals";
     return;
+  }
+  if (tab === "missions") {
+    requestedDrawerSection = "rules";
+  } else if (tab === "workers") {
+    requestedDrawerSection = "workers";
+  } else if (tab === "inbox") {
+    requestedDrawerSection = null;
   }
   requestedTab = tab;
 }
@@ -800,6 +1115,68 @@ export function useSelectedConsoleProvider(): string | null {
   );
 }
 
+export function getDeepThinkEnabled(): boolean {
+  return deepThinkEnabled;
+}
+
+export function setDeepThinkEnabled(next: boolean): void {
+  if (deepThinkEnabled === next) return;
+  deepThinkEnabled = next;
+  for (const listener of deepThinkListeners) {
+    listener();
+  }
+}
+
+function subscribeDeepThink(listener: () => void): () => void {
+  deepThinkListeners.add(listener);
+  return () => {
+    deepThinkListeners.delete(listener);
+  };
+}
+
+export function useDeepThinkEnabled(): boolean {
+  return useSyncExternalStore(
+    subscribeDeepThink,
+    getDeepThinkEnabled,
+    getDeepThinkEnabled,
+  );
+}
+
+export function beginPendingChatSend(): () => void {
+  pendingChatSends += 1;
+  for (const listener of chatSendListeners) {
+    listener();
+  }
+  let finished = false;
+  return () => {
+    if (finished) return;
+    finished = true;
+    pendingChatSends = Math.max(0, pendingChatSends - 1);
+    for (const listener of chatSendListeners) {
+      listener();
+    }
+  };
+}
+
+function getPendingChatSending(): boolean {
+  return pendingChatSends > 0;
+}
+
+function subscribePendingChatSending(listener: () => void): () => void {
+  chatSendListeners.add(listener);
+  return () => {
+    chatSendListeners.delete(listener);
+  };
+}
+
+export function useIsChatSending(): boolean {
+  return useSyncExternalStore(
+    subscribePendingChatSending,
+    getPendingChatSending,
+    getPendingChatSending,
+  );
+}
+
 export function getWishDraft(): string {
   return wishDraftText;
 }
@@ -891,11 +1268,17 @@ export function clearBotStore(): void {
   currentSnapshot = EMPTY_SNAPSHOT;
   requestedTab = null;
   requestedInboxFilter = null;
+  requestedDrawerSection = null;
   selectedConsoleProvider = null;
+  deepThinkEnabled = false;
+  pendingChatSends = 0;
   wishDraftText = "";
   wishDraftImages = [];
   optimisticWishSeq = 0;
+  optimisticChatSeq = 0;
   pendingOptimisticWishes.clear();
+  pendingOptimisticChatMessages.clear();
+  localMessageImagePreviews.clear();
   cachedSidebarKey = "0:0:0:0";
   cachedSidebarCounts = {
     pendingApprovalCount: 0,
@@ -905,6 +1288,8 @@ export function clearBotStore(): void {
   };
   listeners.clear();
   providerListeners.clear();
+  deepThinkListeners.clear();
+  chatSendListeners.clear();
   wishDraftListeners.clear();
   wishDraftImagesListeners.clear();
 }

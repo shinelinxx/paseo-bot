@@ -706,7 +706,14 @@ export async function analyzeSessionsForTidy(input: {
     const labels = (rec.labels && typeof rec.labels === "object"
       ? (rec.labels as Record<string, string>)
       : {}) as Record<string, string>;
-    if (labels["paseo-bot/role"] === "scout" || labels["paseo-bot/role"] === "worker") continue;
+    if (
+      labels["paseo-bot/role"] === "scout" ||
+      labels["paseo-bot/role"] === "worker" ||
+      labels["paseo-bot/role"] === "butler-l1" ||
+      labels["paseo-bot/role"] === "butler-exec"
+    ) {
+      continue;
+    }
     if (labels["paseo.parent-agent-id"] || rec.parentAgentId) continue;
     candidateAgents.push(a);
   }

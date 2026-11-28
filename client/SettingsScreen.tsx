@@ -15,11 +15,16 @@ import {
 } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
-import { listModelsRpc, type CatalogProvider } from "../shared/contracts";
+import {
+  listModelsRpc,
+  updateButlerProfileRpc,
+  type CatalogProvider,
+} from "../shared/contracts";
 import { paseoBotSettings, type BotSettings } from "../shared/settings";
+import { optimisticUpdateButlerProfile } from "./store";
 
 const WISH_MODE_OPTIONS = [
-  { label: "每次新任务单开会话（推荐）", value: "per_wish" as const },
+  { label: "每次重任务单开会话（推荐）", value: "per_wish" as const },
   { label: "所有任务共用同一个主对话", value: "shared_chief" as const },
 ];
 
@@ -57,6 +62,7 @@ function buildModelSelectOptions(
 export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
   const settings = useSettings(paseoBotSettings);
   const listModels = useRpc(listModelsRpc);
+  const updateButlerProfile = useRpc(updateButlerProfileRpc);
   const toast = useToast();
   const [draft, setDraft] = useState<BotSettings | null>(null);
   const [catalogProviders, setCatalogProviders] = useState<CatalogProvider[]>([]);
@@ -94,16 +100,52 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
 
   const saveDraftFields = useCallback(async () => {
     if (settings.status !== "ready" || !draft) return;
-    const ok = await settings.save(draft, settings.revision);
+    const normalized: BotSettings = {
+      ...draft,
+      butlerName: draft.butlerName.trim() || "Paseo Bot",
+      userName: draft.userName.trim(),
+    };
+    setDraft(normalized);
+    const ok = await settings.save(normalized, settings.revision);
     if (ok) {
+      optimisticUpdateButlerProfile({
+        butlerName: normalized.butlerName,
+        userName: normalized.userName,
+      });
+      await updateButlerProfile({
+        butlerName: normalized.butlerName,
+        userName: normalized.userName,
+      }).catch(() => undefined);
       toast.show("设置已保存", { variant: "success" });
     } else if (settings.saveError) {
       toast.error(settings.saveError);
     }
-  }, [draft, settings, toast]);
+  }, [draft, settings, toast, updateButlerProfile]);
 
   const current = draft ?? (settings.status === "ready" ? settings.values : null);
 
+  const fastOptions = useMemo(
+    () =>
+      current ? buildModelSelectOptions(catalogProviders, current.fastProvider) : [],
+    [catalogProviders, current?.fastProvider],
+  );
+  const fastFallbackOptions = useMemo(
+    () =>
+      current
+        ? buildModelSelectOptions(catalogProviders, current.fastFallbackProvider)
+        : [],
+    [catalogProviders, current?.fastFallbackProvider],
+  );
+  const execOptions = useMemo(
+    () =>
+      current ? buildModelSelectOptions(catalogProviders, current.execProvider) : [],
+    [catalogProviders, current?.execProvider],
+  );
+  const deepOptions = useMemo(
+    () =>
+      current ? buildModelSelectOptions(catalogProviders, current.deepProvider) : [],
+    [catalogProviders, current?.deepProvider],
+  );
   const chiefOptions = useMemo(
     () =>
       current ? buildModelSelectOptions(catalogProviders, current.chiefProvider) : [],
@@ -150,11 +192,130 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
 
   return (
     <View style={styles.container}>
+      <SettingsSection title="个人管家与称呼">
+        <SettingsCard>
+          <SettingsInput
+            label="管家称呼"
+            hint="显示在单流对话顶栏与输入框占位符，也可在对话中直接说「以后叫你小点」即时更改。"
+            placeholder="Paseo Bot"
+            initialValue={current.butlerName}
+            onChangeText={(txt) =>
+              setDraft((prev) => ({
+                ...(prev ?? settings.values),
+                butlerName: txt,
+              }))
+            }
+          />
+          <SettingsInput
+            label="你的称呼（选填）"
+            hint="管家在主动提醒与问候中如何自然称呼你（例如：辉）。"
+            placeholder="例如：辉"
+            initialValue={current.userName}
+            onChangeText={(txt) =>
+              setDraft((prev) => ({
+                ...(prev ?? settings.values),
+                userName: txt,
+              }))
+            }
+          />
+          <SettingsAction
+            label="保存管家与用户称呼"
+            actionLabel={settings.saving ? "保存中…" : "保存称呼"}
+            disabled={settings.saving}
+            onPress={() => void saveDraftFields()}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="L1–L3 分层模型分流">
+        <SettingsCard>
+          {hasCatalog ? (
+            <>
+              <SettingsSelect
+                label="L1 极速秒回模型"
+                hint="用于日常寒暄、轻量问答、一句话改记忆与停提醒，追求毫秒级响应。"
+                value={current.fastProvider}
+                options={fastOptions}
+                onValueChange={(v) => void patchImmediate({ fastProvider: v })}
+              />
+              <SettingsSelect
+                label="L1 极速备选模型"
+                hint="当 L1 主选模型限流或不可用时自动无缝切换。"
+                value={current.fastFallbackProvider}
+                options={fastFallbackOptions}
+                onValueChange={(v) => void patchImmediate({ fastFallbackProvider: v })}
+              />
+              <SettingsSelect
+                label="L2 主力查证模型"
+                hint="用于调用工具/MCP 核查（邮箱、Cloudflare、工作区状态）与跨目录派活。"
+                value={current.execProvider}
+                options={execOptions}
+                onValueChange={(v) => void patchImmediate({ execProvider: v })}
+              />
+              <SettingsSelect
+                label="L3 深度思考模型"
+                hint="仅在开启「深度思考 · L3」或复杂规划、架构决策与长文深析时按需调用。"
+                value={current.deepProvider}
+                options={deepOptions}
+                onValueChange={(v) => void patchImmediate({ deepProvider: v })}
+              />
+            </>
+          ) : (
+            <>
+              <SettingsInput
+                label="L1 极速秒回模型"
+                hint="默认 antigravity/gemini-3.8-flash"
+                initialValue={current.fastProvider}
+                onChangeText={(txt) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? settings.values),
+                    fastProvider: txt.trim(),
+                  }))
+                }
+              />
+              <SettingsInput
+                label="L1 极速备选模型"
+                hint="默认 antigravity/gemini-4-hydrogen"
+                initialValue={current.fastFallbackProvider}
+                onChangeText={(txt) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? settings.values),
+                    fastFallbackProvider: txt.trim(),
+                  }))
+                }
+              />
+              <SettingsInput
+                label="L2 主力查证模型"
+                hint="默认 antigravity/gemini-4-carbon"
+                initialValue={current.execProvider}
+                onChangeText={(txt) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? settings.values),
+                    execProvider: txt.trim(),
+                  }))
+                }
+              />
+              <SettingsInput
+                label="L3 深度思考模型"
+                hint="默认 antigravity/gemini-4-neon"
+                initialValue={current.deepProvider}
+                onChangeText={(txt) =>
+                  setDraft((prev) => ({
+                    ...(prev ?? settings.values),
+                    deepProvider: txt.trim(),
+                  }))
+                }
+              />
+            </>
+          )}
+        </SettingsCard>
+      </SettingsSection>
+
       <SettingsSection title="自动运行与通知">
         <SettingsCard>
           <SettingsSelect
             label="新任务会话方式"
-            hint="独立会话（推荐）：每次发送新任务单独开一个会话，共享记忆与自动规则，互不阻塞。"
+            hint="独立会话（推荐）：每次派发重任务单独开一个会话，共享记忆与自动规则，互不阻塞。"
             value={current.wishSessionMode}
             options={WISH_MODE_OPTIONS}
             onValueChange={(v) => void patchImmediate({ wishSessionMode: v })}
@@ -184,7 +345,10 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
             onChangeText={(txt) => {
               const parsed = Number.parseInt(txt, 10);
               if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 200) {
-                setDraft((prev) => ({ ...(prev ?? settings.values), hourlyWakeLimit: parsed }));
+                setDraft((prev) => ({
+                  ...(prev ?? settings.values),
+                  hourlyWakeLimit: parsed,
+                }));
               }
             }}
           />
@@ -209,7 +373,9 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
             label="新建相似会话时提示历史同主题对话"
             hint="当在同一目录新起高度重合的话题时，在时间线顶部提示可续接的原会话。"
             value={current.duplicateSessionHintOnCreate}
-            onValueChange={(v) => void patchImmediate({ duplicateSessionHintOnCreate: v })}
+            onValueChange={(v) =>
+              void patchImmediate({ duplicateSessionHintOnCreate: v })
+            }
           />
           <SettingsSwitch
             label="合并会话时沉淀摘要至知识库 00-Inbox"
@@ -234,27 +400,27 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection title="默认模型设置">
+      <SettingsSection title="后台巡检与子任务默认模型">
         <SettingsCard>
           {hasCatalog ? (
             <>
               <SettingsSelect
-                label="主对话模型"
-                hint="用于处理新建任务与主对话，追问已有会话时会自动沿用原会话模型。"
+                label="斜杠 /wish 主会话默认模型"
+                hint="用于 /wish 命令直派新会话；追问已有会话时会自动沿用原会话模型。"
                 value={current.chiefProvider}
                 options={chiefOptions}
                 onValueChange={(v) => void patchImmediate({ chiefProvider: v })}
               />
               <SettingsSelect
-                label="后台规则检查模型"
-                hint="用于运行定时检查与目录监听。"
+                label="后台规则巡检模型"
+                hint="用于运行定时检查与目录差量监听。"
                 value={current.scoutProvider}
                 options={scoutOptions}
                 onValueChange={(v) => void patchImmediate({ scoutProvider: v })}
               />
               <SettingsSelect
-                label="子任务默认模型"
-                hint="用于跨工作区后台子任务。"
+                label="跨工作区子任务默认模型"
+                hint="用于后台子任务委托（delegate_task）。"
                 value={current.defaultWorkerProvider}
                 options={workerOptions}
                 onValueChange={(v) => void patchImmediate({ defaultWorkerProvider: v })}
@@ -263,8 +429,8 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
           ) : (
             <>
               <SettingsInput
-                label="主对话模型"
-                hint="格式 provider/model，默认 antigravity/gemini-4-neon"
+                label="斜杠 /wish 主会话默认模型"
+                hint="格式 provider/model，默认 antigravity/gemini-4-carbon"
                 initialValue={current.chiefProvider}
                 onChangeText={(txt) =>
                   setDraft((prev) => ({
@@ -274,8 +440,8 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
                 }
               />
               <SettingsInput
-                label="后台规则检查模型"
-                hint="用于运行定时检查与目录监听，默认 antigravity/gemini-4-neon"
+                label="后台规则巡检模型"
+                hint="用于运行定时检查与目录监听，默认 antigravity/gemini-4-carbon"
                 initialValue={current.scoutProvider}
                 onChangeText={(txt) =>
                   setDraft((prev) => ({
@@ -285,8 +451,8 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
                 }
               />
               <SettingsInput
-                label="子任务默认模型"
-                hint="用于跨工作区后台子任务，默认 antigravity/gemini-4-neon"
+                label="跨工作区子任务默认模型"
+                hint="用于跨工作区后台子任务，默认 antigravity/gemini-4-carbon"
                 initialValue={current.defaultWorkerProvider}
                 onChangeText={(txt) =>
                   setDraft((prev) => ({
@@ -314,7 +480,10 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
             hint="可指向本地 Obsidian 笔记文件，支持直接读写同步。"
             initialValue={current.memoryFilePath}
             onChangeText={(txt) =>
-              setDraft((prev) => ({ ...(prev ?? settings.values), memoryFilePath: txt.trim() }))
+              setDraft((prev) => ({
+                ...(prev ?? settings.values),
+                memoryFilePath: txt.trim(),
+              }))
             }
           />
           <SettingsSwitch
@@ -329,7 +498,10 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
             onChangeText={(txt) => {
               const parsed = Number.parseInt(txt, 10);
               if (Number.isFinite(parsed) && parsed >= 1024 && parsed <= 65535) {
-                setDraft((prev) => ({ ...(prev ?? settings.values), webhookPort: parsed }));
+                setDraft((prev) => ({
+                  ...(prev ?? settings.values),
+                  webhookPort: parsed,
+                }));
               }
             }}
           />
@@ -343,7 +515,7 @@ export function BotSettingsScreen({ theme }: PluginSurfaceProps) {
             }
           />
           <SettingsAction
-            label="保存目录与端口设置"
+            label="保存全部输入项设置"
             actionLabel={settings.saving ? "保存中…" : "保存设置"}
             disabled={settings.saving}
             onPress={() => void saveDraftFields()}

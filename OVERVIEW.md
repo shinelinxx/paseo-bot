@@ -10,6 +10,7 @@ Key interaction capabilities:
 2. Actionable update cards grouped into Today and Earlier, with one-tap follow-up buttons, inline replies, two-hour reminders, and feedback controls (`Useful` / `Fewer like this`) that save filter rules back to `MEMORY.md` and the originating rule.
 3. Staged confirmation cards that let you view and edit execution content before running, confirm once, or switch the rule to run automatically next time.
 4. One-sentence rule generator and rule suggestions for directories with repeated manual tasks.
+5. Session and workspace tidy organizer (`/tidy` or `paseo_bot_tidy_sessions`): normalizes messy titles after the first completed turn, hints when a newly started chat duplicates a recent same-topic session, pins canonical hub workspaces for fragmented local directories, and stages an editable checklist card before merging same-topic threads and archiving stale workspaces.
 
 Five event sources run in the daemon subprocess:
 

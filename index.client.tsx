@@ -6,7 +6,10 @@ import { PaseoBotSidebarItem } from "./client/SidebarItem";
 import {
   clearBotStore,
   getLiveBotSnapshot,
+  optimisticSetGlobalPaused,
+  registerBotFullSync,
   setLiveBotSnapshot,
+  setLiveBotSummary,
   setRequestedConsoleTab,
 } from "./client/store";
 import {
@@ -25,26 +28,64 @@ import {
   SIDEBAR_ITEM_ID,
   setGlobalPauseRpc,
   submitWishRpc,
+  tidySessionsRpc,
   watchBotStateSubscription,
+  watchBotSummarySubscription,
 } from "./shared/contracts";
 
 export default function contribute(client: PluginClientContext) {
   const lifetime = new AbortController();
+  let summaryStartupTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const sub = client.subscribe(
-    watchBotStateSubscription,
-    {},
-    (snapshot) => {
-      setLiveBotSnapshot(snapshot);
-    },
-    { signal: lifetime.signal },
-  );
-  void sub.ready.catch(() => {
-    void client
-      .rpc(getBotSnapshotRpc, {})
-      .then((snap) => setLiveBotSnapshot(snap))
-      .catch(() => undefined);
+  // Lazy full-state sync: only active while BotConsoleScreen or BotQuickPopover is open
+  registerBotFullSync(() => {
+    const ctrl = new AbortController();
+    const onLifetimeAbort = () => ctrl.abort();
+    lifetime.signal.addEventListener("abort", onLifetimeAbort, { once: true });
+    const sub = client.subscribe(
+      watchBotStateSubscription,
+      {},
+      (snapshot) => {
+        if (!ctrl.signal.aborted && !lifetime.signal.aborted) {
+          setLiveBotSnapshot(snapshot);
+        }
+      },
+      { signal: ctrl.signal },
+    );
+    void sub.ready.catch(() => {
+      if (ctrl.signal.aborted || lifetime.signal.aborted) return;
+      void client
+        .rpc(getBotSnapshotRpc, {})
+        .then((snap) => {
+          if (!ctrl.signal.aborted && !lifetime.signal.aborted) {
+            setLiveBotSnapshot(snap);
+          }
+        })
+        .catch(() => undefined);
+    });
+    return () => {
+      lifetime.signal.removeEventListener("abort", onLifetimeAbort);
+      ctrl.abort();
+      sub();
+    };
   });
+
+  // Yield first paint, then subscribe to lightweight sidebar badge counts only (~100B vs ~37KB)
+  summaryStartupTimer = setTimeout(() => {
+    summaryStartupTimer = null;
+    if (lifetime.signal.aborted) return;
+    const summarySub = client.subscribe(
+      watchBotSummarySubscription,
+      {},
+      (summary) => {
+        if (!lifetime.signal.aborted) {
+          setLiveBotSummary(summary);
+        }
+      },
+      { signal: lifetime.signal },
+    );
+    void summarySub.ready.catch(() => undefined);
+  }, 1000);
 
   const cleanups = [
     client.addScreen({
@@ -95,7 +136,7 @@ export default function contribute(client: PluginClientContext) {
           wish,
           cwd: workspace.directory,
         });
-        const chiefComposers = composers({ agentId: res.agentId });
+        const chiefComposers = res.agentId ? composers({ agentId: res.agentId }) : [];
         if (chiefComposers[0]) {
           await chiefComposers[0].focus().catch(() => {
             openScreen({ screenId: SCREEN_ID });
@@ -112,7 +153,11 @@ export default function contribute(client: PluginClientContext) {
       description: messages.message("slashBotDesc"),
       argumentHint: messages.message("slashBotHint"),
       onSubmit({ args, openScreen }) {
-        const tabArg = args.trim().toLowerCase();
+        const rawArg = args.trim().toLowerCase();
+        const tabArg =
+          rawArg === "schedules" || rawArg === "schedule" || rawArg === "plans" || rawArg === "plan"
+            ? "missions"
+            : rawArg;
         if (
           tabArg === "inbox" ||
           tabArg === "approvals" ||
@@ -127,6 +172,37 @@ export default function contribute(client: PluginClientContext) {
       },
     }),
 
+    client.addSlashCommand({
+      name: "tidy",
+      context: "workspace",
+      description: messages.message("slashTidyDesc"),
+      argumentHint: messages.message("slashTidyHint"),
+      async onSubmit({ args, rpc, openScreen }) {
+        const arg = args.trim().toLowerCase();
+        const mode = arg === "apply" || arg === "now" ? "apply" : "preview";
+        await rpc(tidySessionsRpc, { mode });
+        setRequestedConsoleTab("inbox");
+        openScreen({ screenId: SCREEN_ID, params: { tab: "inbox" } });
+      },
+    }),
+
+    client.addCommandCenterItem({
+      id: "paseo-bot-tidy",
+      title: messages.message("cmdTidySessions"),
+      icon: "Layers",
+      keywords: ["tidy", "rename", "merge", "archive", "整理", "重命名", "合并", "归档", "会话"],
+      context: "global",
+      async onSelect({ rpc, openScreen }) {
+        const res = await rpc(tidySessionsRpc, { mode: "preview" });
+        if (res.approvalId) {
+          setRequestedConsoleTab("inbox");
+          openScreen({ screenId: SCREEN_ID, params: { tab: "inbox" } });
+          return;
+        }
+        openScreen({ screenId: SCREEN_ID });
+      },
+    }),
+
     client.addCommandCenterItem({
       id: "paseo-bot-open",
       title: messages.message("cmdOpenConsole"),
@@ -135,6 +211,18 @@ export default function contribute(client: PluginClientContext) {
       context: "global",
       onSelect({ openScreen }) {
         openScreen({ screenId: SCREEN_ID });
+      },
+    }),
+
+    client.addCommandCenterItem({
+      id: "paseo-bot-schedules",
+      title: messages.message("cmdOpenSchedules"),
+      icon: "CalendarClock",
+      keywords: ["schedule", "schedules", "plan", "cron", "trigger", "rule", "计划", "定时", "自动规则"],
+      context: "global",
+      onSelect({ openScreen }) {
+        setRequestedConsoleTab("missions");
+        openScreen({ screenId: SCREEN_ID, params: { tab: "missions" } });
       },
     }),
 
@@ -162,14 +250,19 @@ export default function contribute(client: PluginClientContext) {
       keywords: ["pause", "resume", "trigger", "暂停", "触发"],
       context: "global",
       async onSelect({ rpc }) {
-        const current = getLiveBotSnapshot();
-        await rpc(setGlobalPauseRpc, { paused: !current.globalPaused });
+        const next = !getLiveBotSnapshot().globalPaused;
+        optimisticSetGlobalPaused(next);
+        await rpc(setGlobalPauseRpc, { paused: next });
       },
     }),
   ];
 
   return () => {
     lifetime.abort();
+    if (summaryStartupTimer) {
+      clearTimeout(summaryStartupTimer);
+      summaryStartupTimer = null;
+    }
     for (const remove of cleanups) {
       remove();
     }

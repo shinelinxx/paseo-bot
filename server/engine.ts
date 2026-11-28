@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgentProvider, PaseoApi } from "@getpaseo/client";
 import {
   execCommand,
   type PluginServerContext,
@@ -15,17 +15,25 @@ import {
   type ApprovalItem,
   type ApprovalRisk,
   type BotSnapshot,
+  type BotSummary,
+  type CatalogModel,
+  type CatalogProvider,
   type DelegatedWorker,
   type FeedAction,
   type FeedActionKind,
   type FeedFeedback,
   type FeedItem,
   type FeedLevel,
+  type KnownWorkspace,
   type MissionDraft,
   type NativeScheduleItem,
+  type NativeScheduleUpsertInput,
   type PresetId,
+  type PresetInstallResult,
+  type RoutineSuggestion,
   type TriggerSpec,
   type TriggerUpsertInput,
+  type WishImageAttachment,
 } from "../shared/contracts";
 import {
   DEFAULT_BOT_SETTINGS,
@@ -39,10 +47,20 @@ import {
   computeRoutineSuggestions,
   draftMissionFromIntent,
   extractSuggestedActionsFromMarkdown,
+  formatImageSummaryTag,
+  hasDirectSessionReferenceHint,
+  inferWorkspaceAndWatchPath,
+  normalizeAgentImages,
+  resolveWishSubmissionContent,
+  routeDirectWishToSession,
   routeFollowUpCandidate,
   splitReplyIntoPreviewAndDetails,
   type RoutableAgentCandidate,
 } from "./intent";
+import {
+  parseInvalidModeError,
+  pickCompatibleModeId,
+} from "./launch-mode";
 import {
   appendChiefAlertCard,
   sendDesktopNotification,
@@ -55,6 +73,30 @@ import {
   expandHomePath,
   shouldIgnoreWatchPath,
 } from "./storage";
+import {
+  buildNativeSchedulePromptWithGovernance,
+  getPaseoSchedulesDir,
+  parseNativeScheduleRecord,
+  readNativeSchedulesFromDisk,
+  resolveScheduleCadenceArgs,
+} from "./schedules";
+import {
+  analyzeSessionsForTidy,
+  countTidyPlanActions,
+  executeTidyPlan,
+  extractTidyPlanIdFromPrompt,
+  isInternalBotTitle,
+  loadTidyPlan,
+  needsSessionAutoRename,
+  normalizeSessionTitleFast,
+  parseApprovedItemKeysFromMarkdown,
+  provisionalPromptTitle,
+  renamePaseoAgentViaCli,
+  renderTidyPlanMarkdown,
+  saveTidyPlan,
+  scoreSessionTopicSimilarity,
+} from "./tidy";
+import { BOT_ALERT_TIMELINE_KIND } from "../shared/contracts";
 
 interface ActiveFileWatcher {
   watchPath: string;
@@ -72,6 +114,7 @@ const MAX_PENDING_WATCH_FILES = 30;
 const MAX_PENDING_DISPATCHES = 50;
 const MAX_POLL_HTTP_BYTES = 24 * 1024;
 const MAX_REGEX_CACHE_ENTRIES = 64;
+const PROVIDER_CATALOG_TTL_MS = 5 * 60_000;
 
 async function pathExists(targetPath: string): Promise<boolean> {
   if (!targetPath) return false;
@@ -111,6 +154,15 @@ function formatLocalHHMM(d: Date): string {
   return `${hh}:${mm}`;
 }
 
+function formatAgentModelPair(agent: unknown): string | undefined {
+  if (!agent || typeof agent !== "object") return undefined;
+  const rec = agent as Record<string, unknown>;
+  const prov = typeof rec.provider === "string" ? rec.provider.trim() : "";
+  const model = typeof rec.model === "string" ? rec.model.trim() : "";
+  if (prov && model) return `${prov}/${model}`;
+  return prov || model || undefined;
+}
+
 function extractAssistantText(items: readonly AgentTimelineItem[]): string {
   const chunks: string[] = [];
   for (const item of items) {
@@ -129,6 +181,7 @@ export class ProactiveEngine {
   private hookCleanups: Array<() => void> = [];
 
   private readonly subscribers = new Set<(snapshot: BotSnapshot) => void>();
+  private readonly summarySubscribers = new Set<(summary: BotSummary) => void>();
   private readonly fileWatchers = new Map<string, ActiveFileWatcher>();
   private readonly inFlightTriggers = new Set<string>();
   private readonly pollingTriggers = new Set<string>();
@@ -138,8 +191,13 @@ export class ProactiveEngine {
     { triggerId: string; triggerName: string }
   >();
   private readonly reportedTurnAgents = new Set<string>();
+  private readonly autoRenamedAgents = new Set<string>();
+  private readonly duplicateHintedAgents = new Set<string>();
   private readonly pendingDispatches: PendingDispatch[] = [];
   private readonly regexCache = new Map<string, RegExp | null>();
+  private readonly launchingWishWorkerIds = new Set<string>();
+  private readonly launchingWishFeedIds = new Map<string, string>();
+  private readonly cancelledLaunchingWorkers = new Set<string>();
 
   private lastWorkerReconcileAt = 0;
   private workerReconcileInFlight: Promise<void> | null = null;
@@ -147,6 +205,18 @@ export class ProactiveEngine {
   private cachedNativeSchedules: NativeScheduleItem[] = [];
   private cachedNativeSchedulesAt = 0;
   private nativeSchedulesInFlight: Promise<NativeScheduleItem[]> | null = null;
+  private schedulesDirWatcher: fsSync.FSWatcher | null = null;
+  private schedulesDirDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private cachedWorkspaceDirs: KnownWorkspace[] = [];
+  private cachedWorkspaceDirsAt = 0;
+  private workspaceDirsInFlight: Promise<void> | null = null;
+
+  private cachedRoutableCandidates: RoutableAgentCandidate[] = [];
+  private cachedRoutableAt = 0;
+
+  private suggestionsCacheKey = "";
+  private cachedSuggestions: RoutineSuggestion[] = [];
 
   private webhookServer: http.Server | null = null;
   private activeWebhookPort: number | null = null;
@@ -157,6 +227,7 @@ export class ProactiveEngine {
     agentId: string;
     workspaceId: string | null;
     created: boolean;
+    modelUsed?: string;
   }> | null = null;
   private stopped = false;
 
@@ -165,10 +236,16 @@ export class ProactiveEngine {
 
   private cachedProviderCatalogAt = 0;
   private providerCatalogInFlight: Promise<void> | null = null;
+  private readonly cachedProviderModesByCwd = new Map<
+    string,
+    { modes: string[]; fetchedAt: number }
+  >();
   private cachedProviders: Array<{
     id: string;
+    label: string;
     available: boolean;
     defaultModel: string | null;
+    models: CatalogModel[];
     modes: string[];
   }> = [];
 
@@ -242,6 +319,8 @@ export class ProactiveEngine {
 
     this.attachLifecycleHooks(server);
     await this.reconcileRuntime();
+    await this.fetchNativeSchedules(true);
+    this.syncSchedulesDirWatcher();
 
     this.schedulerTimer = setInterval(() => {
       void this.tickScheduler().catch((err) => {
@@ -249,6 +328,12 @@ export class ProactiveEngine {
       });
     }, 10_000);
     this.schedulerTimer.unref?.();
+
+    // Warm up shell PATH and migrate any legacy Bot-only recurring schedules into Paseo native schedules
+    void this.getLoginPath().then(async () => {
+      await this.migrateLegacyScheduleTriggers();
+      await this.refreshNativeSchedulesInBackground(true);
+    });
   }
 
   async stop(): Promise<void> {
@@ -261,6 +346,18 @@ export class ProactiveEngine {
       clearTimeout(this.broadcastTimer);
       this.broadcastTimer = null;
     }
+    if (this.schedulesDirDebounceTimer) {
+      clearTimeout(this.schedulesDirDebounceTimer);
+      this.schedulesDirDebounceTimer = null;
+    }
+    if (this.schedulesDirWatcher) {
+      try {
+        this.schedulesDirWatcher.close();
+      } catch {
+        // Ignore
+      }
+      this.schedulesDirWatcher = null;
+    }
     this.settingsCleanup?.();
     this.settingsCleanup = null;
     for (const remove of this.hookCleanups) remove();
@@ -269,6 +366,7 @@ export class ProactiveEngine {
     await this.closeWebhookServer();
     await this.store.flush().catch(() => undefined);
     this.subscribers.clear();
+    this.summarySubscribers.clear();
   }
 
   getSettings(): BotSettings {
@@ -296,6 +394,7 @@ export class ProactiveEngine {
     this.paseo = paseo;
     if (wasEmpty) {
       void this.reconcileWorkersWithPaseo(true);
+      void this.refreshWorkspaceDirsInBackground(true);
       if (this.pendingDispatches.length > 0) {
         const queued = this.pendingDispatches.splice(0, this.pendingDispatches.length);
         for (const item of queued) {
@@ -386,6 +485,31 @@ export class ProactiveEngine {
     }
   }
 
+  private syncSchedulesDirWatcher(): void {
+    if (this.stopped || this.schedulesDirWatcher) return;
+    const schedulesDir = getPaseoSchedulesDir();
+    try {
+      fsSync.mkdirSync(schedulesDir, { recursive: true });
+      const watcher = fsSync.watch(schedulesDir, () => {
+        if (this.stopped) return;
+        if (this.schedulesDirDebounceTimer) {
+          clearTimeout(this.schedulesDirDebounceTimer);
+        }
+        this.schedulesDirDebounceTimer = setTimeout(() => {
+          this.schedulesDirDebounceTimer = null;
+          void this.refreshNativeSchedulesInBackground(true);
+        }, 80);
+        this.schedulesDirDebounceTimer.unref?.();
+      });
+      watcher.on("error", () => {
+        // Non-fatal
+      });
+      this.schedulesDirWatcher = watcher;
+    } catch {
+      // Directory may not be watchable on remote setups; fallback polling still works
+    }
+  }
+
   private async fetchNativeSchedules(force = false): Promise<NativeScheduleItem[]> {
     const now = Date.now();
     if (
@@ -399,6 +523,13 @@ export class ProactiveEngine {
 
     const task = (async () => {
       try {
+        const diskItems = await readNativeSchedulesFromDisk();
+        if (diskItems !== null) {
+          this.cachedNativeSchedules = diskItems;
+          this.cachedNativeSchedulesAt = Date.now();
+          return this.cachedNativeSchedules;
+        }
+
         const loginPath = await this.getLoginPath();
         const { stdout } = await execCommand("paseo", ["schedule", "ls", "--json"], {
           env: { ...process.env, PATH: loginPath },
@@ -408,17 +539,11 @@ export class ProactiveEngine {
         const parsed = JSON.parse(stdout.trim() || "[]");
         if (Array.isArray(parsed)) {
           this.cachedNativeSchedules = parsed
-            .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
-            .map((item) => ({
-              id: String(item.id ?? ""),
-              name: String(item.name ?? item.id ?? "定时任务"),
-              cadence: String(item.cadence ?? ""),
-              target: String(item.target ?? ""),
-              status: String(item.status ?? "active"),
-              nextRunAt: typeof item.nextRunAt === "string" ? item.nextRunAt : null,
-              lastRunAt: typeof item.lastRunAt === "string" ? item.lastRunAt : null,
-            }))
-            .filter((item) => item.id.length > 0);
+            .map((item) => parseNativeScheduleRecord(item))
+            .filter(
+              (item): item is NativeScheduleItem & { createdAtMs: number } => item !== null,
+            )
+            .map(({ createdAtMs: _ignored, ...rest }) => rest);
         }
       } catch {
         // Keep previous cached list if CLI is temporarily unavailable
@@ -437,9 +562,297 @@ export class ProactiveEngine {
     }
   }
 
+  private async refreshNativeSchedulesInBackground(force = false): Promise<void> {
+    if (this.stopped) return;
+    const prevJson = JSON.stringify(this.cachedNativeSchedules);
+    const next = await this.fetchNativeSchedules(force);
+    if (!this.stopped && JSON.stringify(next) !== prevJson) {
+      await this.broadcastSnapshot();
+    }
+  }
+
+  private async refreshWorkspaceDirsInBackground(force = false): Promise<void> {
+    if (!this.paseo || this.stopped) return;
+    const now = Date.now();
+    if (!force && this.cachedWorkspaceDirsAt > 0 && now - this.cachedWorkspaceDirsAt < 30_000) {
+      return;
+    }
+    if (this.workspaceDirsInFlight) return this.workspaceDirsInFlight;
+    const paseo = this.paseo;
+    const task = (async () => {
+      try {
+        const res = await paseo.workspaces.list();
+        const dirs: KnownWorkspace[] = [];
+        const seen = new Set<string>();
+        for (const ws of res.entries ?? []) {
+          const rawDir = ws.projectRootPath || ws.workspaceDirectory;
+          if (ws.archivingAt || ws.background || ws.internal || !rawDir) continue;
+          const norm = path.resolve(expandHomePath(rawDir));
+          if (seen.has(norm)) continue;
+          seen.add(norm);
+          const label =
+            (ws.projectCustomName && ws.projectCustomName.trim()) ||
+            (ws.projectDisplayName && ws.projectDisplayName.trim()) ||
+            path.basename(norm) ||
+            norm;
+          dirs.push({ cwd: norm, label });
+          if (dirs.length >= 10) break;
+        }
+        const prevJson = JSON.stringify(this.cachedWorkspaceDirs);
+        this.cachedWorkspaceDirs = dirs;
+        this.cachedWorkspaceDirsAt = Date.now();
+        if (!this.stopped && JSON.stringify(dirs) !== prevJson) {
+          await this.broadcastSnapshot();
+        }
+      } catch {
+        this.cachedWorkspaceDirsAt = Date.now();
+      }
+    })();
+    this.workspaceDirsInFlight = task;
+    try {
+      await task;
+    } finally {
+      if (this.workspaceDirsInFlight === task) {
+        this.workspaceDirsInFlight = null;
+      }
+    }
+  }
+
+  private buildKnownWorkspaces(state: import("./storage").PersistedBotState): KnownWorkspace[] {
+    const out: KnownWorkspace[] = [];
+    const seen = new Set<string>();
+    const add = (rawCwd?: string, customLabel?: string) => {
+      if (!rawCwd?.trim()) return;
+      const norm = path.resolve(expandHomePath(rawCwd));
+      if (seen.has(norm)) return;
+      seen.add(norm);
+      const label = customLabel?.trim() || path.basename(norm) || norm;
+      out.push({ cwd: norm, label });
+    };
+
+    add(this.settings.homeCwd);
+    for (const ws of this.cachedWorkspaceDirs) {
+      add(ws.cwd, ws.label);
+    }
+    for (const t of state.triggers) {
+      add(t.cwd);
+    }
+    for (const w of state.workers) {
+      add(w.cwd);
+    }
+    return out.slice(0, 8);
+  }
+
+  private getMemoizedSuggestions(
+    state: import("./storage").PersistedBotState,
+  ): RoutineSuggestion[] {
+    const activeMask = state.triggers
+      .filter((t) => t.enabled)
+      .map((t) => `${t.id}:${t.cwd}`)
+      .join(",");
+    const key = `${this.settings.homeCwd}|${state.workers.length}:${state.workers[0]?.id ?? ""}|${state.triggers.length}:${activeMask}|${state.dismissedSuggestionIds.join(",")}`;
+    if (key === this.suggestionsCacheKey) {
+      return this.cachedSuggestions;
+    }
+    this.suggestionsCacheKey = key;
+    this.cachedSuggestions = computeRoutineSuggestions(state, this.settings.homeCwd);
+    return this.cachedSuggestions;
+  }
+
+  async upsertNativeSchedule(input: NativeScheduleUpsertInput): Promise<NativeScheduleItem> {
+    const cleanName = input.name.trim();
+    if (!cleanName) {
+      throw new Error("计划名称不能为空");
+    }
+    const rawPrompt = input.prompt.trim();
+    if (!rawPrompt) {
+      throw new Error("计划执行说明不能为空");
+    }
+
+    const expandedInputCwd = input.cwd?.trim() ? expandHomePath(input.cwd.trim()) : "";
+    const expandedHome = expandHomePath(this.settings.homeCwd);
+    const targetCwd =
+      expandedInputCwd && (await pathExists(expandedInputCwd))
+        ? expandedInputCwd
+        : (await pathExists(expandedHome))
+          ? expandedHome
+          : os.homedir();
+
+    const cadenceSpec = resolveScheduleCadenceArgs({
+      cron: input.cron,
+      dailyTime: input.dailyTime,
+      everySec: input.everySec,
+      timezone: input.timezone,
+    });
+    const cadenceFlags =
+      cadenceSpec.mode === "cron"
+        ? ["--cron", cadenceSpec.cron, "--timezone", cadenceSpec.timezone]
+        : ["--every", cadenceSpec.every];
+
+    const loginPath = await this.getLoginPath();
+    const env = { ...process.env, PATH: loginPath };
+    const cleanEditId = input.id?.trim();
+
+    if (cleanEditId) {
+      if (!/^[A-Za-z0-9_-]+$/.test(cleanEditId)) {
+        throw new Error("无效的定时计划 ID");
+      }
+      const updateArgs = [
+        "schedule",
+        "update",
+        cleanEditId,
+        "--name",
+        cleanName,
+        "--prompt",
+        rawPrompt,
+        "--cwd",
+        targetCwd,
+        ...cadenceFlags,
+      ];
+      if (input.provider?.trim()) {
+        updateArgs.push("--provider", input.provider.trim());
+      }
+      updateArgs.push("--json");
+
+      await execCommand("paseo", updateArgs, {
+        env,
+        timeout: 10_000,
+        maxBuffer: 256 * 1024,
+      });
+
+      if (input.enabled !== undefined) {
+        const currentList = await this.fetchNativeSchedules(true);
+        const existing = currentList.find((s) => s.id === cleanEditId);
+        const currentlyActive = existing ? existing.status === "active" : true;
+        if (input.enabled && !currentlyActive) {
+          await execCommand("paseo", ["schedule", "resume", cleanEditId], {
+            env,
+            timeout: 8_000,
+          });
+        } else if (!input.enabled && currentlyActive) {
+          await execCommand("paseo", ["schedule", "pause", cleanEditId], {
+            env,
+            timeout: 8_000,
+          });
+        }
+      }
+
+      const refreshed = await this.fetchNativeSchedules(true);
+      await this.broadcastSnapshot();
+      const updated = refreshed.find((s) => s.id === cleanEditId);
+      if (!updated) {
+        throw new Error(`未找到已更新的定时计划 ${cleanEditId}`);
+      }
+      return updated;
+    }
+
+    const launch = await this.resolveLaunchConfig(
+      input.provider?.trim() || this.settings.scoutProvider,
+      this.settings.scoutModeId,
+      targetCwd,
+    );
+    const finalPrompt = buildNativeSchedulePromptWithGovernance(
+      rawPrompt,
+      input.governance,
+      input.noiseRules,
+    );
+    const cliSafePrompt = finalPrompt.startsWith("-") ? `\n${finalPrompt}` : finalPrompt;
+
+    const createArgs = [
+      "schedule",
+      "create",
+      "--name",
+      cleanName,
+      ...cadenceFlags,
+      "--provider",
+      launch.provider,
+      ...(launch.modeId ? ["--mode", launch.modeId] : []),
+      "--cwd",
+      targetCwd,
+      "--json",
+      cliSafePrompt,
+    ];
+
+    const { stdout } = await execCommand("paseo", createArgs, {
+      env,
+      timeout: 10_000,
+      maxBuffer: 256 * 1024,
+    });
+
+    let createdId = "";
+    try {
+      const parsed = JSON.parse(stdout.trim()) as Record<string, unknown>;
+      createdId = String(parsed.id ?? "").trim();
+    } catch {
+      createdId = "";
+    }
+
+    if (createdId && input.enabled === false) {
+      await execCommand("paseo", ["schedule", "pause", createdId], {
+        env,
+        timeout: 8_000,
+      }).catch(() => undefined);
+    }
+
+    const refreshed = await this.fetchNativeSchedules(true);
+    await this.broadcastSnapshot();
+    const createdItem =
+      (createdId ? refreshed.find((s) => s.id === createdId) : undefined) ??
+      refreshed.find((s) => s.name === cleanName);
+    if (!createdItem) {
+      throw new Error("创建定时计划成功，但读取最新状态失败");
+    }
+    return createdItem;
+  }
+
+  private async migrateLegacyScheduleTriggers(): Promise<void> {
+    if (this.stopped) return;
+    const state = await this.store.load();
+    const legacySchedules = state.triggers.filter(
+      (t) => t.kind === "schedule" && !t.onceAt,
+    );
+    if (legacySchedules.length === 0) return;
+
+    const existingNative = await this.fetchNativeSchedules(true);
+    const migratedTriggerIds = new Set<string>();
+
+    for (const trg of legacySchedules) {
+      try {
+        const cleanName = trg.name.trim();
+        const duplicate = existingNative.find(
+          (ns) => ns.name.trim().toLowerCase() === cleanName.toLowerCase(),
+        );
+        if (!duplicate) {
+          await this.upsertNativeSchedule({
+            name: cleanName,
+            prompt: trg.prompt,
+            cwd: trg.cwd,
+            dailyTime: trg.dailyTime,
+            everySec: trg.pollIntervalSec,
+            governance: trg.governance,
+            noiseRules: trg.noiseRules,
+            provider: trg.providerOverride,
+            enabled: trg.enabled,
+          });
+        }
+        migratedTriggerIds.add(trg.id);
+      } catch (err) {
+        console.error(`[paseo-bot] failed to migrate schedule trigger '${trg.name}':`, err);
+      }
+    }
+
+    if (migratedTriggerIds.size > 0) {
+      await this.store.mutate((draft) => {
+        draft.triggers = draft.triggers.filter((t) => !migratedTriggerIds.has(t.id));
+      });
+      await this.fetchNativeSchedules(true);
+      await this.broadcastSnapshot();
+    }
+  }
+
   async manageNativeSchedule(input: {
     id: string;
-    action: "run_once" | "pause" | "resume";
+    action: "run_once" | "pause" | "resume" | "delete";
   }): Promise<{ ok: boolean; message: string }> {
     const cleanId = input.id.trim();
     if (!/^[A-Za-z0-9_-]+$/.test(cleanId)) {
@@ -450,7 +863,9 @@ export class ProactiveEngine {
         ? "run-once"
         : input.action === "pause"
           ? "pause"
-          : "resume";
+          : input.action === "resume"
+            ? "resume"
+            : "delete";
     try {
       const loginPath = await this.getLoginPath();
       await execCommand("paseo", ["schedule", subcmd, cleanId], {
@@ -464,8 +879,10 @@ export class ProactiveEngine {
         input.action === "run_once"
           ? "已触发立即运行"
           : input.action === "pause"
-            ? "已暂停定时任务"
-            : "已恢复定时任务";
+            ? "已暂停定时计划"
+            : input.action === "resume"
+              ? "已恢复定时计划"
+              : "已删除定时计划";
       return { ok: true, message: label };
     } catch (err) {
       return {
@@ -539,6 +956,35 @@ export class ProactiveEngine {
     };
   }
 
+  subscribeSummary(listener: (summary: BotSummary) => void): () => void {
+    this.summarySubscribers.add(listener);
+    return () => {
+      this.summarySubscribers.delete(listener);
+    };
+  }
+
+  async getSummary(): Promise<BotSummary> {
+    const state = await this.store.load();
+    let unreadCount = 0;
+    for (const f of state.feed) {
+      if (f.unread && f.level !== "silent") unreadCount += 1;
+    }
+    let pendingApprovalCount = 0;
+    for (const a of state.approvals) {
+      if (a.status === "pending") pendingApprovalCount += 1;
+    }
+    let runningWorkerCount = 0;
+    for (const w of state.workers) {
+      if (w.status === "running" || w.status === "permission") runningWorkerCount += 1;
+    }
+    return {
+      globalPaused: this.settings.globalPaused,
+      unreadCount,
+      pendingApprovalCount,
+      runningWorkerCount,
+    };
+  }
+
   private async reloadSettings(
     settingsHandle: PluginSettings<typeof BotSettingsSchema>,
   ): Promise<void> {
@@ -553,14 +999,14 @@ export class ProactiveEngine {
   }
 
   async getSnapshot(opts?: { includeMemory?: boolean }): Promise<BotSnapshot> {
-    await this.reconcileWorkersWithPaseo(false);
-    const [state, nativeSchedules, memoryContent] = await Promise.all([
+    const now = Date.now();
+    const [state, memoryContent] = await Promise.all([
       this.store.load(),
-      this.fetchNativeSchedules(false),
       opts?.includeMemory === false
         ? Promise.resolve("")
         : this.store.readMemory(this.settings.memoryFilePath),
     ]);
+
     let unreadCount = 0;
     for (const f of state.feed) {
       if (f.unread && f.level !== "silent") unreadCount += 1;
@@ -578,11 +1024,25 @@ export class ProactiveEngine {
       totalSilentChecks += t.silentCount || 0;
     }
 
+    // Stale-while-revalidate: never block UI snapshot reads on CLI subprocesses or agent RPCs
+    if (runningWorkerCount > 0 && now - this.lastWorkerReconcileAt >= 10_000) {
+      void this.reconcileWorkersWithPaseo(false);
+    }
+    if (this.cachedNativeSchedulesAt === 0 || now - this.cachedNativeSchedulesAt >= 30_000) {
+      void this.refreshNativeSchedulesInBackground(false);
+    }
+    if (
+      this.paseo &&
+      (this.cachedWorkspaceDirsAt === 0 || now - this.cachedWorkspaceDirsAt >= 30_000)
+    ) {
+      void this.refreshWorkspaceDirsInBackground(false);
+    }
+
     return {
       chiefAgentId: state.chiefAgentId,
       chiefWorkspaceId: state.chiefWorkspaceId,
       webhookBaseUrl: this.getWebhookBaseUrl(),
-      hourlyWakesUsed: this.store.countRecentWakes(),
+      hourlyWakesUsed: this.store.countRecentWakes(now),
       hourlyWakeLimit: this.settings.hourlyWakeLimit,
       globalPaused: this.settings.globalPaused,
       unreadCount,
@@ -590,34 +1050,65 @@ export class ProactiveEngine {
       runningWorkerCount,
       totalSilentChecks,
       triggers: state.triggers,
-      nativeSchedules,
+      nativeSchedules: this.cachedNativeSchedules,
       feed: state.feed.slice(0, 40),
       approvals: state.approvals.slice(0, 25),
       workers: state.workers.slice(0, 25),
-      routineSuggestions: computeRoutineSuggestions(state, this.settings.homeCwd),
+      routineSuggestions: this.getMemoizedSuggestions(state),
+      knownWorkspaces: this.buildKnownWorkspaces(state),
       memoryContent,
       memoryPath: this.settings.memoryFilePath,
     };
   }
 
   async broadcastSnapshot(): Promise<void> {
-    if (this.subscribers.size === 0 || this.stopped) return;
+    if ((this.subscribers.size === 0 && this.summarySubscribers.size === 0) || this.stopped) return;
     if (this.broadcastTimer) return;
     this.broadcastTimer = setTimeout(() => {
       this.broadcastTimer = null;
-      if (this.subscribers.size === 0 || this.stopped) return;
-      void this.getSnapshot()
-        .then((snapshot) => {
-          for (const listener of this.subscribers) {
-            try {
-              listener(snapshot);
-            } catch {
-              // Ignore broken listener
+      if ((this.subscribers.size === 0 && this.summarySubscribers.size === 0) || this.stopped) return;
+      if (this.subscribers.size > 0) {
+        void this.getSnapshot()
+          .then((snapshot) => {
+            for (const listener of this.subscribers) {
+              try {
+                listener(snapshot);
+              } catch {
+                // Ignore broken listener
+              }
             }
-          }
-        })
-        .catch(() => undefined);
-    }, 180);
+            if (this.summarySubscribers.size > 0) {
+              const summary: BotSummary = {
+                globalPaused: snapshot.globalPaused,
+                unreadCount: snapshot.unreadCount,
+                pendingApprovalCount: snapshot.pendingApprovalCount,
+                runningWorkerCount: snapshot.runningWorkerCount,
+              };
+              for (const listener of this.summarySubscribers) {
+                try {
+                  listener(summary);
+                } catch {
+                  // Ignore broken listener
+                }
+              }
+            }
+          })
+          .catch(() => undefined);
+      } else {
+        void this.getSummary()
+          .then((summary) => {
+            for (const listener of this.summarySubscribers) {
+              try {
+                listener(summary);
+              } catch {
+                // Ignore broken listener
+              }
+            }
+          })
+          .catch(() => undefined);
+      }
+    }, 40);
+    this.broadcastTimer.unref?.();
   }
 
   async reconcileRuntime(): Promise<void> {
@@ -830,6 +1321,30 @@ export class ProactiveEngine {
       return;
     }
 
+    if (parsedUrl.pathname === "/tidy" && (req.method ?? "POST").toUpperCase() === "POST") {
+      const secret = this.settings.webhookSecret.trim();
+      if (secret) {
+        const headerSecret =
+          String(req.headers["x-paseo-bot-secret"] ?? "").trim() ||
+          String(req.headers.authorization ?? "")
+            .replace(/^Bearer\s+/i, "")
+            .trim();
+        const expectedBuf = Buffer.from(secret, "utf8");
+        const actualBuf = Buffer.from(headerSecret, "utf8");
+        if (
+          expectedBuf.length !== actualBuf.length ||
+          !crypto.timingSafeEqual(expectedBuf, actualBuf)
+        ) {
+          sendJson(401, { ok: false, error: "Invalid webhook secret" });
+          return;
+        }
+      }
+      const modeParam = parsedUrl.searchParams.get("mode") === "apply" ? "apply" : "preview";
+      const result = await this.tidySessions({ mode: modeParam });
+      sendJson(result.ok ? 200 : 503, result);
+      return;
+    }
+
     const match = /^\/hook\/([A-Za-z0-9_-]+)$/.exec(parsedUrl.pathname);
     if (!match) {
       sendJson(404, { ok: false, error: "Route not found. Use POST /hook/<webhookKey>" });
@@ -844,7 +1359,12 @@ export class ProactiveEngine {
         String(req.headers.authorization ?? "")
           .replace(/^Bearer\s+/i, "")
           .trim();
-      if (headerSecret !== secret) {
+      const expectedBuf = Buffer.from(secret, "utf8");
+      const actualBuf = Buffer.from(headerSecret, "utf8");
+      if (
+        expectedBuf.length !== actualBuf.length ||
+        !crypto.timingSafeEqual(expectedBuf, actualBuf)
+      ) {
         sendJson(401, { ok: false, error: "Invalid webhook secret" });
         return;
       }
@@ -1119,77 +1639,173 @@ export class ProactiveEngine {
     }
   }
 
-  private async resolveLaunchConfig(
+  private startProviderCatalogRefresh(): Promise<void> {
+    if (!this.paseo) return Promise.resolve();
+    if (this.providerCatalogInFlight) return this.providerCatalogInFlight;
+    const paseo = this.paseo;
+    const task = (async () => {
+      try {
+        const snap = await paseo.providers.snapshot();
+        const entries = Array.isArray(snap.entries) ? snap.entries : [];
+        const resolved = await Promise.all(
+          entries.map(async (entry) => {
+            const available =
+              Boolean(entry.enabled) &&
+              (entry.status === "ready" || entry.status === "loading");
+            if (!available) return null;
+
+            const [rawModels, rawModes] = await Promise.all([
+              (entry.models?.length ?? 0) > 0 || entry.status !== "ready"
+                ? Promise.resolve(entry.models ?? [])
+                : paseo.providers
+                    .listModels(entry.provider)
+                    .then((r) => r.models ?? [])
+                    .catch(() => []),
+              (entry.modes?.length ?? 0) > 0 || entry.status !== "ready"
+                ? Promise.resolve(entry.modes ?? [])
+                : paseo.providers
+                    .listModes(entry.provider)
+                    .then((r) => r.modes ?? [])
+                    .catch(() => []),
+            ]);
+
+            const models: CatalogModel[] = rawModels
+              .filter((m) => m.isSelectable !== false)
+              .map((m) => ({
+                id: m.id,
+                label: m.label || m.id,
+                description: m.description ?? undefined,
+                isDefault: m.isDefault || undefined,
+              }));
+
+            const defaultModel =
+              models.find((m) => m.isDefault)?.id ?? models[0]?.id ?? null;
+
+            const modes = rawModes
+              .map((mode) => (typeof mode.id === "string" ? mode.id : ""))
+              .filter(Boolean);
+
+            return {
+              id: String(entry.provider),
+              label: entry.label || String(entry.provider),
+              available: true,
+              defaultModel,
+              models,
+              modes,
+            };
+          }),
+        );
+
+        const nextProviders = resolved.filter(
+          (p): p is NonNullable<typeof p> => p !== null && p.models.length > 0,
+        );
+        nextProviders.sort((a, b) => a.label.localeCompare(b.label));
+        if (nextProviders.length > 0) {
+          this.cachedProviders = nextProviders;
+          this.cachedProviderCatalogAt = Date.now();
+        }
+      } catch {
+        // Keep previous cache as fallback
+      }
+    })();
+    this.providerCatalogInFlight = task;
+    task.finally(() => {
+      if (this.providerCatalogInFlight === task) {
+        this.providerCatalogInFlight = null;
+      }
+    });
+    return task;
+  }
+
+  private async ensureProviderCatalog(force = false): Promise<void> {
+    if (!this.paseo) return;
+    const now = Date.now();
+    const ttlMs = 5 * 60_000;
+    const hasCache = this.cachedProviders.length > 0;
+    if (!force && hasCache) {
+      if (now - this.cachedProviderCatalogAt >= ttlMs) {
+        // SWR: return cached catalog immediately and refresh in background
+        void this.startProviderCatalogRefresh();
+      }
+      return;
+    }
+    await this.startProviderCatalogRefresh();
+  }
+
+  async listAvailableModels(force = false): Promise<{
+    defaultProvider: string;
+    providers: CatalogProvider[];
+  }> {
+    await this.ensureProviderCatalog(force);
+    return {
+      defaultProvider: this.settings.chiefProvider,
+      providers: this.cachedProviders.map((p) => ({
+        id: p.id,
+        label: p.label,
+        models: p.models,
+      })),
+    };
+  }
+
+  private providerModesCacheKey(providerId: string, cwd: string): string {
+    return `${providerId}\0${path.resolve(expandHomePath(cwd))}`;
+  }
+
+  private setCachedProviderModesForCwd(
+    providerId: string,
+    cwd: string,
+    modes: readonly string[],
+  ): void {
+    const key = this.providerModesCacheKey(providerId, cwd);
+    if (this.cachedProviderModesByCwd.size >= 64 && !this.cachedProviderModesByCwd.has(key)) {
+      const oldest = this.cachedProviderModesByCwd.keys().next().value;
+      if (oldest !== undefined) this.cachedProviderModesByCwd.delete(oldest);
+    }
+    this.cachedProviderModesByCwd.set(key, {
+      modes: [...modes],
+      fetchedAt: Date.now(),
+    });
+  }
+
+  private async getProviderModesForCwd(
+    providerId: string,
+    cwd?: string,
+    fallbackModes?: readonly string[],
+  ): Promise<string[]> {
+    const fallback = [...(fallbackModes ?? [])];
+    if (!this.paseo || !providerId || !cwd) return fallback;
+
+    const normCwd = path.resolve(expandHomePath(cwd));
+    const key = `${providerId}\0${normCwd}`;
+    const ttlMs = 5 * 60_000;
+    const cached = this.cachedProviderModesByCwd.get(key);
+    if (cached && Date.now() - cached.fetchedAt < ttlMs) {
+      return cached.modes;
+    }
+
+    try {
+      const res = await this.paseo.providers.listModes(providerId as PaseoAgentProvider, {
+        cwd: normCwd,
+      });
+      const modes = (res.modes ?? [])
+        .map((mode) => (typeof mode.id === "string" ? mode.id : ""))
+        .filter(Boolean);
+      if (modes.length > 0) {
+        this.setCachedProviderModesForCwd(providerId, normCwd, modes);
+        return modes;
+      }
+    } catch {
+      // Fall back to global catalog modes (and createAgentWithModeFallback protects launch)
+    }
+
+    return fallback;
+  }
+
+  private resolveLaunchConfigFromCache(
     preferredProviderModel: string,
     preferredModeId: string,
-  ): Promise<{ provider: string; modeId?: string }> {
-    if (!this.paseo) {
-      return { provider: preferredProviderModel, modeId: preferredModeId || undefined };
-    }
-
-    const now = Date.now();
-    if (now - this.cachedProviderCatalogAt > 5 * 60_000 || this.cachedProviders.length === 0) {
-      if (!this.providerCatalogInFlight) {
-        const paseo = this.paseo;
-        const task = (async () => {
-          try {
-            const snap = await paseo.providers.snapshot();
-            const rawProviders =
-              (snap as { payload?: { providers?: unknown[] }; providers?: unknown[] }).payload
-                ?.providers ??
-              (snap as { providers?: unknown[] }).providers ??
-              [];
-            const nextProviders: typeof this.cachedProviders = [];
-            for (const item of rawProviders) {
-              if (!item || typeof item !== "object") continue;
-              const rec = item as Record<string, unknown>;
-              const id = typeof rec.id === "string" ? rec.id : "";
-              const available = rec.status === "available" || rec.available === true;
-              const models = Array.isArray(rec.models) ? rec.models : [];
-              let defaultModel: string | null = null;
-              for (const m of models) {
-                if (m && typeof m === "object") {
-                  const mRec = m as Record<string, unknown>;
-                  if (mRec.isDefault && typeof mRec.id === "string") {
-                    defaultModel = mRec.id;
-                    break;
-                  }
-                  if (!defaultModel && typeof mRec.id === "string") {
-                    defaultModel = mRec.id;
-                  }
-                }
-              }
-              const modes = Array.isArray(rec.modes)
-                ? rec.modes
-                    .map((mode) =>
-                      mode &&
-                      typeof mode === "object" &&
-                      typeof (mode as { id?: unknown }).id === "string"
-                        ? (mode as { id: string }).id
-                        : "",
-                    )
-                    .filter(Boolean)
-                : [];
-              if (id) {
-                nextProviders.push({ id, available, defaultModel, modes });
-              }
-            }
-            this.cachedProviders = nextProviders;
-            this.cachedProviderCatalogAt = Date.now();
-          } catch {
-            // Keep fallback
-          }
-        })();
-        this.providerCatalogInFlight = task;
-        task.finally(() => {
-          if (this.providerCatalogInFlight === task) {
-            this.providerCatalogInFlight = null;
-          }
-        });
-      }
-      await this.providerCatalogInFlight;
-    }
-
+    cwd?: string,
+  ): { provider: string; modeId?: string } {
     const [reqProv, reqModel] = preferredProviderModel.includes("/")
       ? preferredProviderModel.split("/", 2)
       : [preferredProviderModel, ""];
@@ -1197,21 +1813,104 @@ export class ProactiveEngine {
     const matched = this.cachedProviders.find((p) => p.id === reqProv && p.available);
     const chosen = matched ?? this.cachedProviders.find((p) => p.available);
     if (!chosen) {
-      return { provider: preferredProviderModel, modeId: preferredModeId || undefined };
+      const cachedModes =
+        reqProv && cwd
+          ? this.cachedProviderModesByCwd.get(this.providerModesCacheKey(reqProv, cwd))?.modes
+          : undefined;
+      return {
+        provider: preferredProviderModel,
+        modeId: cachedModes
+          ? pickCompatibleModeId(preferredModeId, cachedModes)
+          : preferredModeId || undefined,
+      };
     }
 
     const finalModel = matched && reqModel ? reqModel : chosen.defaultModel;
     const providerPair = finalModel ? `${chosen.id}/${finalModel}` : preferredProviderModel;
 
-    let modeId: string | undefined;
-    if (preferredModeId && chosen.modes.includes(preferredModeId)) {
-      modeId = preferredModeId;
-    } else if (chosen.modes.includes("auto")) {
-      modeId = "auto";
-    } else if (chosen.modes.includes("build")) {
-      modeId = "build";
-    }
+    const cwdCachedModes = cwd
+      ? this.cachedProviderModesByCwd.get(this.providerModesCacheKey(chosen.id, cwd))?.modes
+      : undefined;
+    const modeId = pickCompatibleModeId(preferredModeId, cwdCachedModes ?? chosen.modes);
     return { provider: providerPair, modeId };
+  }
+
+  private async resolveLaunchConfig(
+    preferredProviderModel: string,
+    preferredModeId: string,
+    cwd?: string,
+  ): Promise<{ provider: string; modeId?: string }> {
+    if (!this.paseo) {
+      return { provider: preferredProviderModel, modeId: preferredModeId || undefined };
+    }
+
+    await this.ensureProviderCatalog(false);
+    const [reqProv, reqModel] = preferredProviderModel.includes("/")
+      ? preferredProviderModel.split("/", 2)
+      : [preferredProviderModel, ""];
+
+    const matched = this.cachedProviders.find((p) => p.id === reqProv && p.available);
+    const chosen = matched ?? this.cachedProviders.find((p) => p.available);
+    const providerId = chosen?.id ?? reqProv;
+    const finalModel = chosen
+      ? matched && reqModel
+        ? reqModel
+        : chosen.defaultModel
+      : reqModel || null;
+    const providerPair =
+      chosen && finalModel ? `${chosen.id}/${finalModel}` : preferredProviderModel;
+
+    const modes = await this.getProviderModesForCwd(providerId, cwd, chosen?.modes);
+    const modeId =
+      modes.length > 0
+        ? pickCompatibleModeId(preferredModeId, modes)
+        : preferredModeId || undefined;
+    return { provider: providerPair, modeId };
+  }
+
+  private async createAgentWithModeFallback(
+    workspace: Awaited<ReturnType<PaseoApi["workspaces"]["open"]>>,
+    input: Parameters<Awaited<ReturnType<PaseoApi["workspaces"]["open"]>>["agents"]["create"]>[0],
+    meta: { preferredModeId: string; cwd?: string },
+  ) {
+    try {
+      return await workspace.agents.create(input);
+    } catch (err) {
+      const parsed = parseInvalidModeError(err);
+      if (!parsed) throw err;
+
+      const rawProvider = input.config.provider;
+      const providerId = rawProvider.includes("/") ? rawProvider.split("/", 2)[0] : rawProvider;
+      if (meta.cwd && parsed.availableModes.length > 0) {
+        this.setCachedProviderModesForCwd(providerId, meta.cwd, parsed.availableModes);
+      }
+
+      const rejected = new Set(
+        [parsed.rejectedMode, input.config.modeId].filter(
+          (v): v is string => typeof v === "string" && v.length > 0,
+        ),
+      );
+      const remainingModes = parsed.availableModes.filter((m) => !rejected.has(m));
+      const fallbackModeId =
+        remainingModes.length > 0
+          ? pickCompatibleModeId(meta.preferredModeId, remainingModes)
+          : undefined;
+
+      if (fallbackModeId === input.config.modeId) {
+        throw err;
+      }
+
+      const nextConfig = { ...input.config };
+      if (fallbackModeId) {
+        nextConfig.modeId = fallbackModeId;
+      } else {
+        delete nextConfig.modeId;
+      }
+      return await workspace.agents.create({
+        ...input,
+        config: nextConfig,
+      });
+    }
   }
 
   recordScoutOutcome(agentId: string, outcome: RecordedScoutOutcome): void {
@@ -1224,8 +1923,16 @@ export class ProactiveEngine {
     return this.scoutTriggerMap.get(agentId);
   }
 
-  draftMission(intent: string, cwd?: string): MissionDraft {
-    return draftMissionFromIntent(intent, cwd?.trim() || this.settings.homeCwd);
+  async draftMission(intent: string, cwd?: string): Promise<MissionDraft> {
+    const memoryContent = await this.store
+      .readMemory(this.settings.memoryFilePath)
+      .catch(() => "");
+    return draftMissionFromIntent(
+      intent,
+      cwd?.trim() || this.settings.homeCwd,
+      this.buildKnownWorkspaces(this.store.get()),
+      memoryContent,
+    );
   }
 
   async dismissSuggestion(suggestionId: string): Promise<{ ok: boolean }> {
@@ -1284,6 +1991,10 @@ export class ProactiveEngine {
 
   private async listRoutableAgentCandidates(): Promise<RoutableAgentCandidate[]> {
     if (!this.paseo) return [];
+    const now = Date.now();
+    if (now - this.cachedRoutableAt < 3_000 && this.cachedRoutableCandidates.length > 0) {
+      return this.cachedRoutableCandidates;
+    }
     const [agentRes, wsRes] = await Promise.all([
       this.paseo.agents.list().catch(() => null),
       this.paseo.workspaces.list().catch(() => null),
@@ -1291,6 +2002,8 @@ export class ProactiveEngine {
     if (!agentRes) return [];
 
     const wsMap = new Map<string, { title: string; projectName: string }>();
+    const freshWsDirs: KnownWorkspace[] = [];
+    const seenWsDirs = new Set<string>();
     for (const ws of wsRes?.entries ?? []) {
       const wsTitle = (ws.title && ws.title.trim()) || ws.name || "";
       const projectName =
@@ -1298,6 +2011,18 @@ export class ProactiveEngine {
         ws.projectDisplayName ||
         "";
       wsMap.set(ws.id, { title: wsTitle, projectName });
+      const rawDir = ws.projectRootPath || ws.workspaceDirectory;
+      if (!ws.archivingAt && !ws.background && !ws.internal && rawDir) {
+        const norm = path.resolve(expandHomePath(rawDir));
+        if (!seenWsDirs.has(norm) && freshWsDirs.length < 10) {
+          seenWsDirs.add(norm);
+          freshWsDirs.push({ cwd: norm, label: projectName || path.basename(norm) || norm });
+        }
+      }
+    }
+    if (freshWsDirs.length > 0) {
+      this.cachedWorkspaceDirs = freshWsDirs;
+      this.cachedWorkspaceDirsAt = now;
     }
 
     const results: RoutableAgentCandidate[] = [];
@@ -1326,6 +2051,8 @@ export class ProactiveEngine {
         isBackground: isBg,
       });
     }
+    this.cachedRoutableCandidates = results;
+    this.cachedRoutableAt = now;
     return results;
   }
 
@@ -1334,7 +2061,9 @@ export class ProactiveEngine {
     actionId?: string;
     customKind?: FeedActionKind;
     customPrompt?: string;
+    images?: WishImageAttachment[];
     delayMinutes?: number;
+    fallbackProvider?: string;
   }): Promise<{ ok: boolean; message: string; agentId?: string }> {
     const state = await this.store.load();
     const feedItem = state.feed.find((f) => f.id === input.feedId);
@@ -1350,6 +2079,7 @@ export class ProactiveEngine {
       matchedAction?.kind ?? input.customKind ?? (input.delayMinutes ? "snooze" : "wish");
     const targetCwd = expandHomePath(matchedAction?.cwd || this.settings.homeCwd);
     const nowIso = new Date().toISOString();
+    const attachedImages = normalizeAgentImages(input.images);
 
     if (kind === "snooze" || kind === "self_wake") {
       const delay = matchedAction?.delayMinutes ?? input.delayMinutes ?? 120;
@@ -1385,7 +2115,9 @@ export class ProactiveEngine {
         updatedFeed = { ...found };
       });
       if (updatedFeed) {
-        await appendChiefAlertCard(this.paseo, state.chiefAgentId, updatedFeed);
+        void appendChiefAlertCard(this.paseo, state.chiefAgentId, updatedFeed).catch(
+          () => undefined,
+        );
       }
       await this.broadcastSnapshot();
       const hrs = delay >= 60 && delay % 60 === 0 ? `${delay / 60} 小时` : `${delay} 分钟`;
@@ -1393,15 +2125,23 @@ export class ProactiveEngine {
     }
 
     const fullReference = feedItem.details || feedItem.summary;
+    const rawCustomPrompt = input.customPrompt?.trim() || "";
     const promptText =
       matchedAction?.prompt ||
-      input.customPrompt?.trim() ||
-      `请继续跟进这项内容：「${feedItem.title}」`;
+      rawCustomPrompt ||
+      (attachedImages.length > 0
+        ? `请结合附带的图片继续跟进这项内容：「${feedItem.title}」`
+        : `请继续跟进这项内容：「${feedItem.title}」`);
+    const summaryWithImages =
+      attachedImages.length > 0
+        ? `${rawCustomPrompt || promptText}\n\n${formatImageSummaryTag(attachedImages.length)}`
+        : promptText;
 
     let launchedAgentId: string | undefined;
     let continuedSameOriginSession = false;
+    let inheritedModel: string | undefined;
     let routedExternalTarget:
-      | { agentId: string; title: string; cwd: string; workspaceId?: string }
+      | { agentId: string; title: string; cwd: string; workspaceId?: string; provider?: string }
       | undefined;
 
     if (kind === "delegate") {
@@ -1409,6 +2149,8 @@ export class ProactiveEngine {
         title: matchedAction?.label || `跟进 · ${cleanTaskTitle(feedItem.title).slice(0, 18)}`,
         cwd: targetCwd,
         prompt: `${promptText}\n\n--- 背景参考 ---\n${fullReference.slice(0, 6000)}`,
+        images: attachedImages.length > 0 ? attachedImages : undefined,
+        provider: input.fallbackProvider,
         isolation: "local",
         notifyChiefOnFinish: true,
       });
@@ -1436,8 +2178,13 @@ export class ProactiveEngine {
           const payload = routedAway
             ? `[来自 Paseo Bot 汇总卡片的跟进指令]\n${promptText}`
             : promptText;
-          await handle.send(payload);
+          // Preserve the located session's original model — do not override it
+          await handle.send(
+            payload,
+            attachedImages.length > 0 ? { images: attachedImages } : undefined,
+          );
           launchedAgentId = targetId;
+          inheritedModel = formatAgentModelPair(refreshed.agent);
           if (routedAway) {
             routedExternalTarget = {
               agentId: targetId,
@@ -1448,6 +2195,7 @@ export class ProactiveEngine {
                   : targetId.slice(0, 8)),
               cwd: route?.cwd || refreshed.agent.cwd || targetCwd,
               workspaceId: route?.workspaceId ?? refreshed.agent.workspaceId,
+              provider: inheritedModel,
             };
           } else {
             continuedSameOriginSession = true;
@@ -1459,10 +2207,14 @@ export class ProactiveEngine {
     if (!launchedAgentId) {
       const baseTitle = cleanTaskTitle(feedItem.title).slice(0, 22);
       const res = await this.submitWish({
-        wish: promptText,
+        wish: rawCustomPrompt || promptText,
+        images: input.images,
         cwd: targetCwd,
+        provider: input.fallbackProvider,
         titleOverride: matchedAction?.label || `跟进 · ${baseTitle}`,
         extraContext: fullReference.slice(0, 6000),
+        skipDirectSessionRouting: true,
+        asyncLaunch: true,
       });
       launchedAgentId = res.agentId;
     }
@@ -1493,7 +2245,7 @@ export class ProactiveEngine {
             createdAt: nowIso,
             level: "worker_update",
             title: `正在续接：${cleanRoutedTitle}`,
-            summary: promptText,
+            summary: summaryWithImages,
             actions: [],
             inProgress: true,
             agentId: routedExternalTarget.agentId,
@@ -1515,7 +2267,7 @@ export class ProactiveEngine {
             workspaceId: routedExternalTarget.workspaceId,
             title: cleanRoutedTitle || "续接会话",
             cwd: routedExternalTarget.cwd,
-            provider: this.settings.chiefProvider,
+            provider: routedExternalTarget.provider || this.settings.chiefProvider,
             isolation: "local",
             status: "running",
             goal: promptText.slice(0, 1000),
@@ -1541,7 +2293,7 @@ export class ProactiveEngine {
             workspaceId: found.workspaceId,
             title: cleanTaskTitle(found.title).slice(0, 28) || "继续追问",
             cwd: targetCwd,
-            provider: this.settings.chiefProvider,
+            provider: inheritedModel || this.settings.chiefProvider,
             isolation: "local",
             status: "running",
             goal: promptText.slice(0, 1000),
@@ -1554,15 +2306,18 @@ export class ProactiveEngine {
       updatedFeed = { ...found };
     });
     if (updatedFeed) {
-      await appendChiefAlertCard(this.paseo, state.chiefAgentId, updatedFeed);
+      void appendChiefAlertCard(this.paseo, state.chiefAgentId, updatedFeed).catch(
+        () => undefined,
+      );
     }
     await this.broadcastSnapshot();
+    const modelSuffix = inheritedModel ? `（沿用原模型 ${inheritedModel}）` : "";
     return {
       ok: true,
       message: routedExternalTarget
-        ? `已路由至会话「${cleanTaskTitle(routedExternalTarget.title).slice(0, 22)}」继续处理`
+        ? `已路由至会话「${cleanTaskTitle(routedExternalTarget.title).slice(0, 22)}」${modelSuffix}`
         : continuedSameOriginSession
-          ? "已在原会话继续跟进，完成后将自动更新卡片"
+          ? `已在原会话继续跟进${modelSuffix}`
           : `已开始跟进：${matchedAction?.label || "继续处理"}`,
       agentId: launchedAgentId,
     };
@@ -1578,6 +2333,7 @@ export class ProactiveEngine {
     unread?: boolean;
     triggerId?: string;
     triggerName?: string;
+    approvalId?: string;
     agentId?: string;
     workspaceId?: string;
     notifyDesktop?: boolean;
@@ -1595,6 +2351,7 @@ export class ProactiveEngine {
       inProgress: input.inProgress ?? false,
       triggerId: input.triggerId,
       triggerName: input.triggerName,
+      approvalId: input.approvalId,
       agentId: input.agentId,
       workspaceId: input.workspaceId,
       unread: input.unread ?? (input.level !== "silent" && !input.inProgress),
@@ -1654,9 +2411,10 @@ export class ProactiveEngine {
         target.title = input.title;
         target.summary = input.summary;
         target.details = input.details;
-        if (input.actions && input.actions.length > 0) {
+        if (input.actions !== undefined) {
           target.actions = input.actions;
         }
+        target.snoozedUntil = undefined;
         target.inProgress = false;
         target.unread = input.level !== "silent";
         if (input.workspaceId) target.workspaceId = input.workspaceId;
@@ -1742,6 +2500,7 @@ export class ProactiveEngine {
       details: approval.payloadPreview,
       triggerId: input.triggerId,
       triggerName: input.triggerName,
+      approvalId: approval.id,
       notifyDesktop: true,
       appendChiefTimeline: false,
       beforeMutate: (draft) => {
@@ -1793,6 +2552,61 @@ export class ProactiveEngine {
 
     let executionAgentId: string | undefined;
     if (input.decision === "approved" && this.paseo) {
+      const tidyPlanId =
+        extractTidyPlanIdFromPrompt(target.followUpPrompt) ??
+        extractTidyPlanIdFromPrompt(target.payloadPreview);
+
+      if (tidyPlanId) {
+        const plan = await loadTidyPlan(tidyPlanId);
+        if (plan) {
+          const approvedKeys = parseApprovedItemKeysFromMarkdown(target.followUpPrompt, plan);
+          const loginPath = await this.getLoginPath();
+          const execRes = await executeTidyPlan({
+            paseo: this.paseo,
+            plan,
+            approvedKeys,
+            loginPath,
+            markSelfWrite: (filePath) => this.store.markSelfWrite(filePath),
+          });
+          this.cachedRoutableAt = 0;
+          this.cachedWorkspaceDirsAt = 0;
+
+          const resultSummaryParts = [
+            execRes.pinnedHubs > 0 ? `置顶 ${execRes.pinnedHubs} 个常驻主工作区` : "",
+            execRes.renamedCount > 0 ? `规范重命名 ${execRes.renamedCount} 项` : "",
+            execRes.mergedClusters > 0 ? `合并 ${execRes.mergedClusters} 组同主题会话` : "",
+            execRes.archivedWorkspaces > 0 || execRes.archivedAgents > 0
+              ? `归档 ${execRes.archivedWorkspaces} 个工作区 / ${execRes.archivedAgents} 个旧会话`
+              : "",
+            execRes.obsidianNotesPaths.length > 0
+              ? `生成 ${execRes.obsidianNotesPaths.length} 篇知识库合并摘要`
+              : "",
+          ].filter(Boolean);
+          const summaryLine =
+            resultSummaryParts.length > 0
+              ? `已完成整理：${resultSummaryParts.join(" · ")}。`
+              : "未勾选任何待执行整理项。";
+          const detailLines =
+            execRes.errors.length > 0
+              ? `${summaryLine}\n\n部分跳过或异常：\n${execRes.errors.map((e) => `- ${e}`).join("\n")}`
+              : undefined;
+
+          await this.store.mutate((draft) => {
+            for (const f of draft.feed) {
+              if (f.approvalId === input.id) {
+                f.title = `已完成：${target!.title}`;
+                f.summary = summaryLine;
+                if (detailLines) f.details = detailLines;
+                f.unread = false;
+              }
+            }
+          });
+          await upsertChiefApprovalCard(this.paseo, chiefId, target);
+          await this.broadcastSnapshot();
+          return { ok: true, promotedTriggerName };
+        }
+      }
+
       const worker = await this.delegateTask({
         title: `Approved: ${target.title}`,
         cwd: target.cwd,
@@ -1825,7 +2639,13 @@ export class ProactiveEngine {
 
   async ensureChiefBot(opts?: {
     reset?: boolean;
-  }): Promise<{ agentId: string; workspaceId: string | null; created: boolean }> {
+    provider?: string;
+  }): Promise<{
+    agentId: string;
+    workspaceId: string | null;
+    created: boolean;
+    modelUsed?: string;
+  }> {
     if (this.ensureChiefInFlight && !opts?.reset) {
       return this.ensureChiefInFlight;
     }
@@ -1842,7 +2662,13 @@ export class ProactiveEngine {
 
   private async ensureChiefBotInternal(opts?: {
     reset?: boolean;
-  }): Promise<{ agentId: string; workspaceId: string | null; created: boolean }> {
+    provider?: string;
+  }): Promise<{
+    agentId: string;
+    workspaceId: string | null;
+    created: boolean;
+    modelUsed?: string;
+  }> {
     if (!this.paseo) {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
@@ -1862,6 +2688,7 @@ export class ProactiveEngine {
           agentId: refreshed.agent.id,
           workspaceId: refreshed.agent.workspaceId ?? null,
           created: false,
+          modelUsed: formatAgentModelPair(refreshed.agent),
         };
       }
     }
@@ -1870,29 +2697,34 @@ export class ProactiveEngine {
     const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
     const workspace = await this.paseo.workspaces.open(homeCwd);
     const launch = await this.resolveLaunchConfig(
-      this.settings.chiefProvider,
+      opts?.provider?.trim() || this.settings.chiefProvider,
       this.settings.chiefModeId,
+      homeCwd,
     );
 
-    const chief = await workspace.agents.create({
-      config: {
-        provider: launch.provider,
-        modeId: launch.modeId,
-        systemPrompt: [
-          "You are Paseo Bot, the user's high-EQ Chief-of-Staff coordinator inside Paseo (synthesizing Poke's zero-admin conversational brevity, ChatGPT Pulse's curated briefings, Meta Muse's 3-layer status clarity, OpenAI Dots' staging gates, and Grok Bot's proactive routines).",
-          "Core Principles:",
-          "1. Zero-Admin Intent: The user speaks in high-level wishes and natural feedback. You translate them into persistent triggers (`paseo_bot_create_trigger`), scheduled self-wakes (`paseo_bot_self_wake`), or asynchronous worker delegations (`paseo_bot_delegate_task`) without asking the user to configure raw parameters.",
-          "2. Actionable Pokes over Logs: When calling `paseo_bot_report_outcome` with `level: 'notify'`, lead with a sharp conclusion in `summary`, put deeper evidence in `details`, and attach 1-2 helpful one-tap follow-up buttons in `actions`.",
-          "3. Living Memory & Calibration: Keep user preferences, noise boundaries, and active goals updated in `MEMORY.md` using `paseo_bot_memory_read` and `paseo_bot_memory_write`.",
-          "4. Zero-Token Efficiency: Prefer `poll_command` (SHA-256 diff gate) or `file_watch` triggers so unchanged routine checks consume zero tokens.",
-          "5. Sentinel Staging Gate: Never send external emails/messages, spend money, or make destructive changes directly — call `paseo_bot_request_approval` with `payloadPreview` (exact draft/command/diff) so the user can inspect, tweak, or promote trust.",
-        ].join("\n"),
+    const chief = await this.createAgentWithModeFallback(
+      workspace,
+      {
+        config: {
+          provider: launch.provider,
+          modeId: launch.modeId,
+          systemPrompt: [
+            "You are Paseo Bot, the user's high-EQ Chief-of-Staff coordinator inside Paseo (synthesizing Poke's zero-admin conversational brevity, ChatGPT Pulse's curated briefings, Meta Muse's 3-layer status clarity, OpenAI Dots' staging gates, and Grok Bot's proactive routines).",
+            "Core Principles:",
+            "1. Zero-Admin Intent: The user speaks in high-level wishes and natural feedback. You translate them into persistent triggers (`paseo_bot_create_trigger`), scheduled self-wakes (`paseo_bot_self_wake`), or asynchronous worker delegations (`paseo_bot_delegate_task`) without asking the user to configure raw parameters.",
+            "2. Actionable Pokes over Logs: When calling `paseo_bot_report_outcome` with `level: 'notify'`, lead with a sharp conclusion in `summary`, put deeper evidence in `details`, and attach 1-2 helpful one-tap follow-up buttons in `actions`.",
+            "3. Living Memory & Calibration: Keep user preferences, noise boundaries, and active goals updated in `MEMORY.md` using `paseo_bot_memory_read` and `paseo_bot_memory_write`.",
+            "4. Zero-Token Efficiency: Prefer `poll_command` (SHA-256 diff gate) or `file_watch` triggers so unchanged routine checks consume zero tokens.",
+            "5. Sentinel Staging Gate: Never send external emails/messages, spend money, or make destructive changes directly — call `paseo_bot_request_approval` with `payloadPreview` (exact draft/command/diff) so the user can inspect, tweak, or promote trust.",
+          ].join("\n"),
+        },
+        title: "Paseo Bot",
+        labels: {
+          "paseo-bot/role": "chief",
+        },
       },
-      title: "Paseo Bot",
-      labels: {
-        "paseo-bot/role": "chief",
-      },
-    });
+      { preferredModeId: this.settings.chiefModeId, cwd: homeCwd },
+    );
 
     const workspaceId = chief.workspaceId ?? workspace.id;
     await this.store.mutate((draft) => {
@@ -1901,27 +2733,118 @@ export class ProactiveEngine {
     });
     await this.broadcastSnapshot();
 
-    return { agentId: chief.id, workspaceId, created: true };
+    return { agentId: chief.id, workspaceId, created: true, modelUsed: launch.provider };
   }
 
   async submitWish(input: {
     wish: string;
+    images?: WishImageAttachment[];
     cwd?: string;
+    provider?: string;
     titleOverride?: string;
     extraContext?: string;
-  }): Promise<{ agentId: string; workspaceId: string | null }> {
+    skipDirectSessionRouting?: boolean;
+    asyncLaunch?: boolean;
+  }): Promise<{
+    agentId: string;
+    workspaceId: string | null;
+    feedId?: string;
+    pendingLaunch?: boolean;
+    reusedSession?: boolean;
+    sessionTitle?: string;
+    modelUsed?: string;
+  }> {
     if (!this.paseo) {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
 
-    const cleanWish = input.wish.trim();
+    const paseo = this.paseo;
+    const {
+      cleanWish,
+      attachedImages,
+      effectiveWishText,
+      feedSummaryText,
+      baseLabel,
+    } = resolveWishSubmissionContent({
+      wish: input.wish,
+      images: input.images,
+      titleOverride: input.titleOverride,
+    });
+    if (!cleanWish && attachedImages.length === 0) {
+      throw new Error("Wish text or at least one image is required");
+    }
+
+    // If the wish explicitly locates an existing session (by session ID / conversation:// / quoted workspace),
+    // continue directly in that session and preserve its original model.
+    // Fast regex pre-check skips expensive agents.list() + workspaces.list() IPCs on normal wishes.
+    if (!input.skipDirectSessionRouting && cleanWish && hasDirectSessionReferenceHint(cleanWish)) {
+      const candidates = await this.listRoutableAgentCandidates();
+      const directRoute = routeDirectWishToSession({ wish: cleanWish, candidates });
+      if (directRoute) {
+        const handle = paseo.agents.ref(directRoute.agentId);
+        const refreshed = await handle.refresh().catch(() => null);
+        if (refreshed && !refreshed.agent.archivedAt) {
+          const actualModel = formatAgentModelPair(refreshed.agent);
+          const sessionTitle = cleanTaskTitle(directRoute.title).slice(0, 28) || directRoute.agentId.slice(0, 8);
+          await handle.send(
+            `[来自 Paseo Bot 对话框的续接指令]\n${effectiveWishText}`,
+            attachedImages.length > 0 ? { images: attachedImages } : undefined,
+          );
+          const nowIso = new Date().toISOString();
+          const wsId = directRoute.workspaceId ?? refreshed.agent.workspaceId ?? null;
+          const feedItem = await this.pushFeed({
+            level: "worker_update",
+            title: `正在续接：${sessionTitle}`,
+            summary: feedSummaryText,
+            inProgress: true,
+            unread: false,
+            agentId: directRoute.agentId,
+            workspaceId: wsId ?? undefined,
+            notifyDesktop: false,
+            appendChiefTimeline: false,
+            beforeMutate: (draft) => {
+              const existingWorker = draft.workers.find((w) => w.agentId === directRoute.agentId);
+              if (existingWorker) {
+                existingWorker.status = "running";
+                existingWorker.updatedAt = nowIso;
+                if (actualModel) existingWorker.provider = actualModel;
+              } else {
+                draft.workers.unshift({
+                  id: createShortId("wish"),
+                  agentId: directRoute.agentId,
+                  workspaceId: wsId ?? undefined,
+                  title: sessionTitle,
+                  cwd: directRoute.cwd || refreshed.agent.cwd || expandHomePath(this.settings.homeCwd),
+                  provider: actualModel || this.settings.chiefProvider,
+                  isolation: "local",
+                  status: "running",
+                  goal: feedSummaryText.slice(0, 1000),
+                  notifyChiefOnFinish: false,
+                  createdAt: nowIso,
+                  updatedAt: nowIso,
+                });
+              }
+            },
+          });
+          return {
+            agentId: directRoute.agentId,
+            workspaceId: wsId,
+            feedId: feedItem.id,
+            reusedSession: true,
+            sessionTitle,
+            modelUsed: actualModel,
+          };
+        }
+      }
+    }
+
     const contextNote = input.cwd ? `\n(Submitted from workspace directory: ${input.cwd})` : "";
     const refBlock = input.extraContext
       ? `\n\n--- Reference Context ---\n${input.extraContext}`
       : "";
     const wishPrompt = [
       `[User Task / Goal]`,
-      cleanWish + contextNote + refBlock,
+      effectiveWishText + contextNote + refBlock,
       ``,
       `Execution Guidelines:`,
       `- If this requires ongoing monitoring or scheduled checks, configure or update a rule via \`paseo_bot_create_trigger\` or \`paseo_bot_self_wake\`.`,
@@ -1930,17 +2853,12 @@ export class ProactiveEngine {
       `- When presenting findings that include 1-3 concrete follow-up decisions or optional actions for the user, call \`paseo_bot_report_outcome\` (\`level: "notify"\`) with a concise \`summary\`, full \`details\` (if long), and 1-3 one-tap \`actions\` buttons so the user can click instead of typing.`,
     ].join("\n");
 
-    const baseLabel =
-      input.titleOverride?.trim() ||
-      cleanTaskTitle(cleanWish).replace(/\s+/g, " ").slice(0, 26) +
-        (cleanWish.length > 26 ? "…" : "");
-
     if (this.settings.wishSessionMode === "shared_chief") {
-      const ensured = await this.ensureChiefBot();
-      await this.pushFeed({
+      const ensured = await this.ensureChiefBot({ provider: input.provider });
+      const feedItem = await this.pushFeed({
         level: "wish",
         title: `正在处理：${baseLabel}`,
-        summary: cleanWish,
+        summary: feedSummaryText,
         inProgress: true,
         unread: false,
         agentId: ensured.agentId,
@@ -1948,44 +2866,172 @@ export class ProactiveEngine {
         notifyDesktop: false,
         appendChiefTimeline: false,
       });
-      await this.paseo.agents.ref(ensured.agentId).send(wishPrompt);
-      return { agentId: ensured.agentId, workspaceId: ensured.workspaceId };
+      await paseo.agents
+        .ref(ensured.agentId)
+        .send(wishPrompt, attachedImages.length > 0 ? { images: attachedImages } : undefined);
+      return {
+        agentId: ensured.agentId,
+        workspaceId: ensured.workspaceId,
+        feedId: feedItem.id,
+        reusedSession: !ensured.created,
+        sessionTitle: "Paseo Bot",
+        modelUsed: ensured.modelUsed,
+      };
     }
 
     // Default ("per_wish"): spawn a clean, parallel dedicated session per wish while sharing global memory & triggers
     const expandedInputCwd = input.cwd ? expandHomePath(input.cwd) : "";
+    const memoryContent = !expandedInputCwd
+      ? await this.store.readMemory(this.settings.memoryFilePath).catch(() => "")
+      : "";
+    const inferredCwd = !expandedInputCwd
+      ? inferWorkspaceAndWatchPath(
+          effectiveWishText,
+          this.settings.homeCwd,
+          this.buildKnownWorkspaces(this.store.get()),
+          memoryContent,
+        ).cwd
+      : "";
     const expandedHomeCwd = expandHomePath(this.settings.homeCwd);
     const targetCwd =
       expandedInputCwd && (await pathExists(expandedInputCwd))
         ? expandedInputCwd
-        : (await pathExists(expandedHomeCwd))
-          ? expandedHomeCwd
-          : os.homedir();
-    const workspace = await this.paseo.workspaces.open(targetCwd);
-    const launch = await this.resolveLaunchConfig(
-      this.settings.chiefProvider,
-      this.settings.chiefModeId,
-    );
+        : inferredCwd && (await pathExists(inferredCwd))
+          ? inferredCwd
+          : (await pathExists(expandedHomeCwd))
+            ? expandedHomeCwd
+            : os.homedir();
 
+    const preferredProvider = input.provider?.trim() || this.settings.chiefProvider;
     const wishWorkerId = createShortId("wish");
+    const systemPrompt = [
+      "You are Paseo Bot handling a dedicated background task thread.",
+      "You share persistent memory (`MEMORY.md`) and automatic rules (`paseo_bot_*`) across all threads.",
+      "Never send external emails/messages, spend money, or make destructive changes without calling `paseo_bot_request_approval` with `payloadPreview`.",
+    ].join("\n");
 
-    const wishAgent = await workspace.agents.create({
-      config: {
-        provider: launch.provider,
-        modeId: launch.modeId,
-        systemPrompt: [
-          "You are Paseo Bot handling a dedicated background task thread.",
-          "You share persistent memory (`MEMORY.md`) and automatic rules (`paseo_bot_*`) across all threads.",
-          "Never send external emails/messages, spend money, or make destructive changes without calling `paseo_bot_request_approval` with `payloadPreview`.",
-        ].join("\n"),
+    if (input.asyncLaunch) {
+      const optimisticModel = this.resolveLaunchConfigFromCache(
+        preferredProvider,
+        this.settings.chiefModeId,
+        targetCwd,
+      ).provider;
+      const feedItem = await this.pushFeed({
+        level: "wish",
+        title: `正在处理：${baseLabel}`,
+        summary: feedSummaryText,
+        inProgress: true,
+        unread: false,
+        notifyDesktop: false,
+        appendChiefTimeline: false,
+      });
+
+      // Spawn the workspace & agent asynchronously so the UI submit RPC returns immediately.
+      void (async () => {
+        try {
+          const [workspace, launch] = await Promise.all([
+            paseo.workspaces.open(targetCwd),
+            this.resolveLaunchConfig(preferredProvider, this.settings.chiefModeId, targetCwd),
+          ]);
+          if (this.stopped) return;
+
+          const wishAgent = await this.createAgentWithModeFallback(
+            workspace,
+            {
+              config: {
+                provider: launch.provider,
+                modeId: launch.modeId,
+                systemPrompt,
+              },
+              title: baseLabel,
+              prompt: wishPrompt,
+              ...(attachedImages.length > 0 ? { images: attachedImages } : {}),
+              labels: {
+                "paseo-bot/role": "chief",
+                "paseo-bot/wish-id": wishWorkerId,
+              },
+            },
+            { preferredModeId: this.settings.chiefModeId, cwd: targetCwd },
+          );
+
+          const workspaceId = wishAgent.workspaceId ?? workspace.id;
+          const nowIso = new Date().toISOString();
+          const record: DelegatedWorker = {
+            id: wishWorkerId,
+            agentId: wishAgent.id,
+            workspaceId,
+            title: baseLabel,
+            cwd: targetCwd,
+            provider: launch.provider,
+            isolation: "local",
+            status: "running",
+            goal: feedSummaryText.slice(0, 1000),
+            notifyChiefOnFinish: false,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
+
+          await this.store.mutate((draft) => {
+            if (!draft.workers.some((w) => w.id === wishWorkerId || w.agentId === wishAgent.id)) {
+              draft.workers.unshift(record);
+            }
+            const card = draft.feed.find((f) => f.id === feedItem.id);
+            if (card) {
+              card.agentId = wishAgent.id;
+              card.workspaceId = workspaceId;
+            }
+          });
+          await this.broadcastSnapshot();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await this.store.mutate((draft) => {
+            const card = draft.feed.find((f) => f.id === feedItem.id);
+            if (card) {
+              card.level = "error";
+              card.title = `启动失败：${baseLabel}`;
+              card.summary = `${feedSummaryText}\n\n启动失败：${msg}`;
+              card.inProgress = false;
+              card.unread = true;
+            }
+          });
+          await this.broadcastSnapshot();
+        }
+      })();
+
+      return {
+        agentId: "",
+        workspaceId: null,
+        feedId: feedItem.id,
+        pendingLaunch: true,
+        reusedSession: false,
+        sessionTitle: baseLabel,
+        modelUsed: optimisticModel,
+      };
+    }
+
+    const [workspace, launch] = await Promise.all([
+      paseo.workspaces.open(targetCwd),
+      this.resolveLaunchConfig(preferredProvider, this.settings.chiefModeId, targetCwd),
+    ]);
+
+    const wishAgent = await this.createAgentWithModeFallback(
+      workspace,
+      {
+        config: {
+          provider: launch.provider,
+          modeId: launch.modeId,
+          systemPrompt,
+        },
+        title: baseLabel,
+        prompt: wishPrompt,
+        ...(attachedImages.length > 0 ? { images: attachedImages } : {}),
+        labels: {
+          "paseo-bot/role": "chief",
+          "paseo-bot/wish-id": wishWorkerId,
+        },
       },
-      title: baseLabel,
-      prompt: wishPrompt,
-      labels: {
-        "paseo-bot/role": "chief",
-        "paseo-bot/wish-id": wishWorkerId,
-      },
-    });
+      { preferredModeId: this.settings.chiefModeId, cwd: targetCwd },
+    );
 
     const workspaceId = wishAgent.workspaceId ?? workspace.id;
     const nowIso = new Date().toISOString();
@@ -1998,16 +3044,16 @@ export class ProactiveEngine {
       provider: launch.provider,
       isolation: "local",
       status: "running",
-      goal: cleanWish.slice(0, 1000),
+      goal: feedSummaryText.slice(0, 1000),
       notifyChiefOnFinish: false,
       createdAt: nowIso,
       updatedAt: nowIso,
     };
 
-    await this.pushFeed({
+    const feedItem = await this.pushFeed({
       level: "wish",
       title: `正在处理：${baseLabel}`,
-      summary: cleanWish,
+      summary: feedSummaryText,
       inProgress: true,
       unread: false,
       agentId: wishAgent.id,
@@ -2019,13 +3065,21 @@ export class ProactiveEngine {
       },
     });
 
-    return { agentId: wishAgent.id, workspaceId };
+    return {
+      agentId: wishAgent.id,
+      workspaceId,
+      feedId: feedItem.id,
+      reusedSession: false,
+      sessionTitle: baseLabel,
+      modelUsed: launch.provider,
+    };
   }
 
   async delegateTask(input: {
     title: string;
     cwd: string;
     prompt: string;
+    images?: Array<{ data: string; mimeType: string }>;
     provider?: string;
     modeId?: string;
     isolation?: "local" | "worktree";
@@ -2043,38 +3097,43 @@ export class ProactiveEngine {
         ? expandedHome
         : os.homedir();
     const isolation = input.isolation ?? "local";
-    const launch = await this.resolveLaunchConfig(
-      input.provider?.trim() || this.settings.defaultWorkerProvider,
-      input.modeId?.trim() || this.settings.defaultWorkerModeId,
-    );
-
     const workerId = createShortId("wrk");
-    let workspaceHandle;
-    if (isolation === "worktree") {
-      workspaceHandle = await this.paseo.workspaces.create({
-        title: input.title,
-        source: {
-          kind: "worktree",
-          cwd: targetCwd,
-          action: "branch-off",
-        },
-      });
-    } else {
-      workspaceHandle = await this.paseo.workspaces.open(targetCwd);
-    }
+    const preferredWorkerModeId = input.modeId?.trim() || this.settings.defaultWorkerModeId;
+    const [launch, workspaceHandle] = await Promise.all([
+      this.resolveLaunchConfig(
+        input.provider?.trim() || this.settings.defaultWorkerProvider,
+        preferredWorkerModeId,
+        targetCwd,
+      ),
+      isolation === "worktree"
+        ? this.paseo.workspaces.create({
+            title: input.title,
+            source: {
+              kind: "worktree",
+              cwd: targetCwd,
+              action: "branch-off",
+            },
+          })
+        : this.paseo.workspaces.open(targetCwd),
+    ]);
 
-    const agentHandle = await workspaceHandle.agents.create({
-      config: {
-        provider: launch.provider,
-        modeId: launch.modeId,
+    const agentHandle = await this.createAgentWithModeFallback(
+      workspaceHandle,
+      {
+        config: {
+          provider: launch.provider,
+          modeId: launch.modeId,
+        },
+        title: `Bot Worker · ${input.title}`,
+        prompt: input.prompt,
+        ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+        labels: {
+          "paseo-bot/role": "worker",
+          "paseo-bot/worker-id": workerId,
+        },
       },
-      title: `Bot Worker · ${input.title}`,
-      prompt: input.prompt,
-      labels: {
-        "paseo-bot/role": "worker",
-        "paseo-bot/worker-id": workerId,
-      },
-    });
+      { preferredModeId: preferredWorkerModeId, cwd: targetCwd },
+    );
 
     const nowIso = new Date().toISOString();
     const record: DelegatedWorker = {
@@ -2208,10 +3267,10 @@ export class ProactiveEngine {
     return saved;
   }
 
-  async installPreset(presetId: PresetId): Promise<TriggerSpec> {
+  async installPreset(presetId: PresetId): Promise<PresetInstallResult> {
     const kbRoot = expandHomePath(this.settings.homeCwd);
     if (presetId === "kb_inbox") {
-      return this.upsertTrigger({
+      const saved = await this.upsertTrigger({
         name: "00-Inbox 新草稿自动整理",
         description: "监听 00-Inbox 新增草稿，按 AGENTS.md 规范自动归类、补全元数据并更新 INDEX.md",
         kind: "file_watch",
@@ -2228,10 +3287,11 @@ export class ProactiveEngine {
           "3. 整理完成后调用 `paseo_bot_report_outcome`（`level: 'notify'`）汇报整理了哪些笔记。",
         ].join("\n"),
       });
+      return { id: saved.id, name: saved.name, isNativeSchedule: false };
     }
 
     if (presetId === "universal_webhook") {
-      return this.upsertTrigger({
+      const saved = await this.upsertTrigger({
         name: "本地 Webhook 外部事件回调",
         description: "接收快捷指令、脚本或外部告警推送并按优先级处理",
         kind: "webhook",
@@ -2247,18 +3307,54 @@ export class ProactiveEngine {
           "- 若事件要求执行外发消息、修改关键业务数据等敏感操作，请调用 `paseo_bot_request_approval` 提交执行方案等待用户批准。",
         ].join("\n"),
       });
+      return { id: saved.id, name: saved.name, isNativeSchedule: false };
     }
 
-    return this.upsertTrigger({
+    const currentSchedules = await this.fetchNativeSchedules(true);
+
+    if (presetId === "session_tidy") {
+      const existing = currentSchedules.find(
+        (s) => s.name.includes("会话自动整理") || s.cronExpression === "30 22 * * *",
+      );
+      if (existing) {
+        if (existing.status !== "active") {
+          await this.manageNativeSchedule({ id: existing.id, action: "resume" });
+        }
+        return { id: existing.id, name: existing.name, isNativeSchedule: true };
+      }
+      const created = await this.upsertNativeSchedule({
+        name: "每日 22:30 会话自动整理",
+        dailyTime: "22:30",
+        governance: "require_approval",
+        cwd: kbRoot,
+        prompt: [
+          "现在是每日工作区与会话整理时间。",
+          "1. 直接调用 `paseo_bot_tidy_sessions`（传入 `mode: 'preview'`）。",
+          "2. 若返回的 `actionCount` 为 0，说明当前工作区已经非常整洁，立即调用 `paseo_bot_report_outcome` (`level: 'silent'`) 静默退出。",
+          "3. 若已生成待确认整理预览卡片，直接结束本轮即可（无需重复发送额外卡片）。",
+        ].join("\n"),
+      });
+      return { id: created.id, name: created.name, isNativeSchedule: true };
+    }
+
+    const existingMorning = currentSchedules.find(
+      (s) =>
+        s.name.includes("早间汇总") ||
+        s.name.includes("晨间") ||
+        s.cronExpression === "30 8 * * *",
+    );
+    if (existingMorning) {
+      if (existingMorning.status !== "active") {
+        await this.manageNativeSchedule({ id: existingMorning.id, action: "resume" });
+      }
+      return { id: existingMorning.id, name: existingMorning.name, isNativeSchedule: true };
+    }
+
+    const createdMorning = await this.upsertNativeSchedule({
       name: "每日 08:30 早间汇总",
-      description: "每天早上检查长期关注事项、收件箱与待办进展",
-      kind: "schedule",
       dailyTime: "08:30",
-      pollIntervalSec: 3600,
       governance: "notify",
-      executionTarget: "scout_helper",
       cwd: kbRoot,
-      cooldownSec: 300,
       prompt: [
         "现在是每日晨间巡检时间。",
         "1. 调用 `paseo_bot_memory_read` 查看用户当前长期关注事项，并检查 `00-Inbox/` 及 `10-Projects/` 最新状态。",
@@ -2266,6 +3362,11 @@ export class ProactiveEngine {
         "3. 如果有待推进事项或收件箱积压，整理一份不超过 6 行的清爽晨间简报，通过 `paseo_bot_report_outcome` (`level: 'notify'`) 推送给用户。",
       ].join("\n"),
     });
+    return {
+      id: createdMorning.id,
+      name: createdMorning.name,
+      isNativeSchedule: true,
+    };
   }
 
   async toggleTrigger(id: string, enabled: boolean): Promise<boolean> {
@@ -2297,6 +3398,21 @@ export class ProactiveEngine {
       await this.broadcastSnapshot();
     }
     return removed;
+  }
+
+  async clearFinishedReminders(): Promise<number> {
+    let removedCount = 0;
+    await this.store.mutate((draft) => {
+      const before = draft.triggers.length;
+      draft.triggers = draft.triggers.filter(
+        (t) => !(t.kind === "self_wake" && !t.enabled),
+      );
+      removedCount = before - draft.triggers.length;
+    });
+    if (removedCount > 0) {
+      await this.broadcastSnapshot();
+    }
+    return removedCount;
   }
 
   async dispatchTrigger(
@@ -2447,21 +3563,26 @@ export class ProactiveEngine {
       const launch = await this.resolveLaunchConfig(
         trigger.providerOverride || this.settings.scoutProvider,
         this.settings.scoutModeId,
+        targetCwd,
       );
 
-      const helper = await workspace.agents.create({
-        config: {
-          provider: launch.provider,
-          modeId: launch.modeId,
+      const helper = await this.createAgentWithModeFallback(
+        workspace,
+        {
+          config: {
+            provider: launch.provider,
+            modeId: launch.modeId,
+          },
+          title: `Scout · ${trigger.name}`,
+          prompt: composedPrompt,
+          background: true,
+          labels: {
+            "paseo-bot/role": "scout",
+            "paseo-bot/trigger-id": trigger.id,
+          },
         },
-        title: `Scout · ${trigger.name}`,
-        prompt: composedPrompt,
-        background: true,
-        labels: {
-          "paseo-bot/role": "scout",
-          "paseo-bot/trigger-id": trigger.id,
-        },
-      });
+        { preferredModeId: this.settings.scoutModeId, cwd: targetCwd },
+      );
       this.scoutTriggerMap.set(helper.id, {
         triggerId: trigger.id,
         triggerName: trigger.name,
@@ -2578,11 +3699,312 @@ export class ProactiveEngine {
     }
   }
 
+  private async maybeHintDuplicateSessionOnStart(
+    agent: { id: string; cwd: string; title: string | null; background: boolean },
+    turnId: string | null,
+    paseo: PaseoApi,
+  ): Promise<void> {
+    if (
+      !this.settings.duplicateSessionHintOnCreate ||
+      agent.background ||
+      this.duplicateHintedAgents.has(agent.id) ||
+      isInternalBotTitle(agent.title)
+    ) {
+      return;
+    }
+    try {
+      const ref = paseo.agents.ref(agent.id);
+      const snap = await ref.refresh().catch(() => null);
+      if (!snap || snap.agent.archivedAt) return;
+      const rec = snap.agent as unknown as Record<string, unknown>;
+      const labels = (rec.labels && typeof rec.labels === "object"
+        ? (rec.labels as Record<string, string>)
+        : {}) as Record<string, string>;
+      if (labels["paseo-bot/role"] || labels["paseo.parent-agent-id"] || rec.parentAgentId) {
+        this.duplicateHintedAgents.add(agent.id);
+        return;
+      }
+
+      const page = await ref.timeline
+        .refetch({ direction: "after", projection: "projected", limit: 6 })
+        .catch(() => null);
+      const userEntries = (page?.entries ?? []).filter((e) => e.item.type === "user_message");
+      if (userEntries.length !== 1) {
+        if (userEntries.length > 1) this.duplicateHintedAgents.add(agent.id);
+        return;
+      }
+      if (turnId && userEntries[0].turnId && userEntries[0].turnId !== turnId) {
+        this.duplicateHintedAgents.add(agent.id);
+        return;
+      }
+
+      const firstPrompt =
+        userEntries[0].item.type === "user_message" ? userEntries[0].item.text.trim() : "";
+      if (!firstPrompt) return;
+      this.duplicateHintedAgents.add(agent.id);
+
+      const norm = normalizeSessionTitleFast({
+        currentTitle: snap.agent.title,
+        firstPrompt,
+        cwd: agent.cwd,
+      });
+
+      const candidates = await this.listRoutableAgentCandidates();
+      const sevenDaysAgo = Date.now() - 7 * 24 * 3_600_000;
+      let bestMatch: { candidate: (typeof candidates)[number]; score: number } | null = null;
+
+      for (const c of candidates) {
+        if (c.id === agent.id || c.updatedAtMs < sevenDaysAgo) continue;
+        if (isInternalBotTitle(c.title)) continue;
+        const candNorm = normalizeSessionTitleFast({ currentTitle: c.title, cwd: c.cwd });
+        const score = scoreSessionTopicSimilarity(
+          { title: norm.title, firstPrompt, category: norm.category, cwd: agent.cwd },
+          { title: c.title || candNorm.title, category: candNorm.category, cwd: c.cwd },
+        );
+        if (score >= 42 && (!bestMatch || score > bestMatch.score)) {
+          bestMatch = { candidate: c, score };
+        }
+      }
+
+      if (!bestMatch) return;
+      const matched = bestMatch.candidate;
+      await ref.timeline
+        .append({
+          type: "plugin",
+          id: `dup-hint-${agent.id.slice(0, 8)}`,
+          kind: BOT_ALERT_TIMELINE_KIND,
+          version: 1,
+          data: {
+            feedId: `dup_${agent.id.slice(0, 8)}`,
+            level: "notify",
+            title: `检测到近期同主题会话：「${matched.title || matched.id.slice(0, 7)}」`,
+            summary: `同一目录下已有相关会话（\`${matched.id.slice(0, 7)}\`）。你可以直接切回原会话续接，或继续当前对话后用 \`/tidy\` 自动合并归档。`,
+            routedAgentId: matched.id,
+            routedAgentTitle: matched.title || matched.id.slice(0, 7),
+            actions: [],
+            createdAt: new Date().toISOString(),
+          },
+        })
+        .catch(() => undefined);
+    } catch {
+      // Non-blocking hint
+    }
+  }
+
+  private async maybeAutoRenameSessionAfterTurn(
+    agent: { id: string; cwd: string; title: string | null; background: boolean },
+    turnId: string | null,
+    paseo: PaseoApi,
+  ): Promise<void> {
+    if (
+      !this.settings.autoRenameOnFirstTurn ||
+      agent.background ||
+      this.autoRenamedAgents.has(agent.id) ||
+      isInternalBotTitle(agent.title)
+    ) {
+      return;
+    }
+    try {
+      const ref = paseo.agents.ref(agent.id);
+      const snap = await ref.refresh().catch(() => null);
+      if (!snap || snap.agent.archivedAt) return;
+      const rec = snap.agent as unknown as Record<string, unknown>;
+      const labels = (rec.labels && typeof rec.labels === "object"
+        ? (rec.labels as Record<string, string>)
+        : {}) as Record<string, string>;
+      if (labels["paseo-bot/role"] || labels["paseo.parent-agent-id"] || rec.parentAgentId) {
+        this.autoRenamedAgents.add(agent.id);
+        return;
+      }
+
+      const currentTitle = typeof snap.agent.title === "string" ? snap.agent.title.trim() : "";
+      const headPage = await ref.timeline
+        .refetch({ direction: "after", projection: "projected", limit: 8 })
+        .catch(() => null);
+      const userMsgs = (headPage?.entries ?? []).filter((e) => e.item.type === "user_message");
+      if (userMsgs.length === 0) return;
+
+      const firstPrompt =
+        userMsgs[0].item.type === "user_message" ? userMsgs[0].item.text.trim() : "";
+      if (!needsSessionAutoRename(currentTitle, firstPrompt)) {
+        this.autoRenamedAgents.add(agent.id);
+        return;
+      }
+
+      let assistantReply = "";
+      const tailPage = await ref.timeline
+        .refetch({ direction: "tail", limit: 1, wholeTurns: true })
+        .catch(() => null);
+      const matching = turnId
+        ? (tailPage?.entries ?? []).filter((e) => e.turnId === turnId)
+        : (tailPage?.entries ?? []);
+      assistantReply = extractAssistantText(matching.map((e) => e.item));
+
+      const norm = normalizeSessionTitleFast({
+        currentTitle,
+        firstPrompt,
+        assistantReply,
+        cwd: snap.agent.cwd || agent.cwd,
+      });
+      this.autoRenamedAgents.add(agent.id);
+      if (!norm.title || norm.title === currentTitle) return;
+
+      const loginPath = await this.getLoginPath();
+      await renamePaseoAgentViaCli({
+        agentId: agent.id,
+        title: norm.title,
+        labels: { "tidy.category": norm.category },
+        loginPath,
+      });
+
+      const wsId = snap.agent.workspaceId;
+      if (wsId) {
+        const wsHandle = paseo.workspaces.ref(wsId);
+        const wsSnap = await wsHandle.refresh().catch(() => null);
+        const wsTitle = (wsSnap?.title ?? "").trim();
+        const prov = provisionalPromptTitle(firstPrompt);
+        if (
+          wsSnap &&
+          wsSnap.workspaceKind !== "worktree" &&
+          !wsSnap.pinnedAt &&
+          (!wsTitle || wsTitle === currentTitle || (prov && wsTitle === prov))
+        ) {
+          await wsHandle.setTitle(norm.title).catch(() => undefined);
+        }
+      }
+      this.cachedRoutableAt = 0;
+    } catch {
+      // Non-blocking auto-rename
+    }
+  }
+
+  async tidySessions(input?: {
+    mode?: "preview" | "apply";
+    idleHours?: number;
+    closedHours?: number;
+    ensurePinnedHubs?: boolean;
+    callerAgentId?: string;
+  }): Promise<{
+    ok: boolean;
+    actionCount: number;
+    approvalId?: string;
+    summary: string;
+  }> {
+    if (!this.paseo) {
+      return {
+        ok: false,
+        actionCount: 0,
+        summary: "Paseo daemon 尚未连接，请稍后重试。",
+      };
+    }
+
+    const mode = input?.mode ?? "preview";
+    const state = await this.store.load();
+    const plan = await analyzeSessionsForTidy({
+      paseo: this.paseo,
+      chiefAgentId: state.chiefAgentId,
+      chiefWorkspaceId: state.chiefWorkspaceId,
+      callerAgentId: input?.callerAgentId,
+      idleArchiveHours: input?.idleHours ?? this.settings.tidyIdleArchiveHours,
+      closedArchiveHours: input?.closedHours,
+      ensurePinnedHubs: input?.ensurePinnedHubs ?? true,
+      writeObsidianDigest: this.settings.tidyWriteObsidianDigest,
+      homeCwd: this.settings.homeCwd,
+    });
+
+    const actionCount = countTidyPlanActions(plan);
+    if (actionCount === 0) {
+      return {
+        ok: true,
+        actionCount: 0,
+        summary: `已扫描 ${plan.scannedWorkspaces} 个工作区与 ${plan.scannedAgents} 个会话，当前均已规范整洁，无需整理。`,
+      };
+    }
+
+    await saveTidyPlan(plan);
+    const markdown = renderTidyPlanMarkdown(plan);
+    const parts = [
+      plan.hubs.length > 0 ? `置顶 ${plan.hubs.length} 个常驻主工作区` : "",
+      plan.renames.length > 0 ? `规范重命名 ${plan.renames.length} 项` : "",
+      plan.merges.length > 0 ? `合并归档 ${plan.merges.length} 组同主题会话` : "",
+      plan.archives.length > 0 ? `清理 ${plan.archives.length} 项空壳/完结会话` : "",
+    ].filter(Boolean);
+    const headlineSummary = `扫描 ${plan.scannedWorkspaces} 个工作区 · 拟${parts.join("、")}。`;
+
+    if (mode === "apply") {
+      const loginPath = await this.getLoginPath();
+      const execRes = await executeTidyPlan({
+        paseo: this.paseo,
+        plan,
+        loginPath,
+        markSelfWrite: (filePath) => this.store.markSelfWrite(filePath),
+      });
+      this.cachedRoutableAt = 0;
+      this.cachedWorkspaceDirsAt = 0;
+      const doneText = [
+        execRes.pinnedHubs > 0 ? `置顶 ${execRes.pinnedHubs} 个常驻主工作区` : "",
+        execRes.renamedCount > 0 ? `重命名 ${execRes.renamedCount} 项` : "",
+        execRes.mergedClusters > 0 ? `合并 ${execRes.mergedClusters} 组同主题会话` : "",
+        execRes.archivedWorkspaces > 0 || execRes.archivedAgents > 0
+          ? `归档 ${execRes.archivedWorkspaces} 个工作区 / ${execRes.archivedAgents} 个会话`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const summary = `已完成会话整理：${doneText || "无变更"}。`;
+      await this.pushFeed({
+        level: "notify",
+        title: "已完成工作区与会话整理",
+        summary,
+        details: markdown,
+        notifyDesktop: false,
+        appendChiefTimeline: true,
+      });
+      return { ok: true, actionCount, summary };
+    }
+
+    // Deduplicate any older pending tidy approval cards so the Approvals tab stays clean
+    await this.store.mutate((draft) => {
+      for (const a of draft.approvals) {
+        if (
+          a.status === "pending" &&
+          extractTidyPlanIdFromPrompt(a.followUpPrompt)
+        ) {
+          a.status = "rejected";
+          a.resolvedAt = new Date().toISOString();
+          a.decisionNote = "已被最新生成的整理预览覆盖";
+        }
+      }
+      draft.feed = draft.feed.filter(
+        (f) => !(f.level === "approval_required" && f.title.includes("工作区与会话整理预览")),
+      );
+    });
+
+    const approval = await this.createApproval({
+      title: "工作区与会话整理预览",
+      actionSummary: headlineSummary,
+      payloadPreview: markdown,
+      payloadLanguage: "markdown",
+      riskLevel: "low",
+      followUpPrompt: markdown,
+      cwd: this.settings.homeCwd,
+      sourceAgentId: input?.callerAgentId,
+    });
+
+    return {
+      ok: true,
+      actionCount,
+      approvalId: approval.id,
+      summary: headlineSummary,
+    };
+  }
+
   private attachLifecycleHooks(server: PluginServerContext): void {
-    const rmTurnBefore = server.addHook("agent.turn.before", async ({ agent }, { paseo }) => {
+    const rmTurnBefore = server.addHook("agent.turn.before", async ({ agent, turnId }, { paseo }) => {
       this.attachPaseo(paseo);
       this.reportedTurnAgents.delete(agent.id);
       if (agent.background) return;
+      void this.maybeHintDuplicateSessionOnStart(agent, turnId, paseo);
       const worker = this.store
         .get()
         .workers.find((w) => w.agentId === agent.id && w.status !== "archived");
@@ -2604,6 +4026,9 @@ export class ProactiveEngine {
         const alreadyReportedViaTool = this.reportedTurnAgents.has(agent.id);
         this.reportedTurnAgents.delete(agent.id);
         if (agent.background) return;
+        if (outcome.kind === "completed") {
+          void this.maybeAutoRenameSessionAfterTurn(agent, turnId, paseo);
+        }
 
         const worker = this.store
           .get()
@@ -2724,8 +4149,61 @@ export class ProactiveEngine {
       },
     );
 
+    const rmPermAfter = server.addHook(
+      "agent.permission.after",
+      async ({ agent }, { paseo }) => {
+        this.attachPaseo(paseo);
+        const worker = this.store
+          .get()
+          .workers.find((w) => w.agentId === agent.id && w.status === "permission");
+        if (!worker) return;
+        const nowIso = new Date().toISOString();
+        await this.store.mutate((draft) => {
+          const found = draft.workers.find((w) => w.id === worker.id);
+          if (found && found.status === "permission") {
+            found.status = "running";
+            found.updatedAt = nowIso;
+          }
+          for (const f of draft.feed) {
+            if (f.agentId === agent.id && f.level === "approval_required" && f.unread) {
+              f.unread = false;
+            }
+          }
+        });
+        await this.broadcastSnapshot();
+      },
+    );
+
+    const rmClose = server.addHook("agent.close.after", async ({ agent }, { paseo }) => {
+      this.attachPaseo(paseo);
+      this.cachedRoutableAt = 0;
+      const worker = this.store
+        .get()
+        .workers.find(
+          (w) =>
+            w.agentId === agent.id &&
+            (w.status === "running" || w.status === "permission"),
+        );
+      if (!worker) return;
+      const nowIso = new Date().toISOString();
+      await this.store.mutate((draft) => {
+        const found = draft.workers.find((w) => w.id === worker.id);
+        if (found && (found.status === "running" || found.status === "permission")) {
+          found.status = "completed";
+          found.updatedAt = nowIso;
+        }
+        for (const f of draft.feed) {
+          if (f.agentId === agent.id && f.inProgress) {
+            f.inProgress = false;
+          }
+        }
+      });
+      await this.broadcastSnapshot();
+    });
+
     const rmArchive = server.addHook("agent.archive.after", async ({ agent }, { paseo }) => {
       this.attachPaseo(paseo);
+      this.cachedRoutableAt = 0;
       const current = this.store.get();
       const matchesChief = current.chiefAgentId === agent.id;
       const matchesWorker = current.workers.some(
@@ -2734,6 +4212,7 @@ export class ProactiveEngine {
       if (!matchesChief && !matchesWorker) return;
 
       let changed = false;
+      const nowIso = new Date().toISOString();
       await this.store.mutate((draft) => {
         if (draft.chiefAgentId === agent.id) {
           draft.chiefAgentId = null;
@@ -2743,13 +4222,26 @@ export class ProactiveEngine {
         const worker = draft.workers.find((w) => w.agentId === agent.id);
         if (worker && worker.status !== "archived") {
           worker.status = "archived";
-          worker.updatedAt = new Date().toISOString();
+          worker.updatedAt = nowIso;
           changed = true;
+        }
+        for (const f of draft.feed) {
+          if (f.agentId === agent.id && f.inProgress) {
+            f.inProgress = false;
+            changed = true;
+          }
         }
       });
       if (changed) await this.broadcastSnapshot();
     });
 
-    this.hookCleanups.push(rmTurnBefore, rmTurnAfter, rmPermBefore, rmArchive);
+    this.hookCleanups.push(
+      rmTurnBefore,
+      rmTurnAfter,
+      rmPermBefore,
+      rmPermAfter,
+      rmClose,
+      rmArchive,
+    );
   }
 }

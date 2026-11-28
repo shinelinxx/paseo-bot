@@ -121,6 +121,7 @@ export const FeedItemSchema = z.object({
   snoozedUntil: z.string().optional(),
   triggerId: z.string().optional(),
   triggerName: z.string().optional(),
+  approvalId: z.string().optional(),
   agentId: z.string().optional(),
   workspaceId: z.string().optional(),
   routedAgentId: z.string().optional(),
@@ -200,13 +201,30 @@ export type RoutineSuggestion = z.output<typeof RoutineSuggestionSchema>;
 export const NativeScheduleSchema = z.object({
   id: z.string(),
   name: z.string(),
+  prompt: z.string().default(""),
   cadence: z.string(),
+  cronExpression: z.string().optional(),
+  timezone: z.string().optional(),
+  every: z.string().optional(),
+  cwd: z.string().default(""),
   target: z.string(),
+  provider: z.string().default(""),
+  modeId: z.string().optional(),
   status: z.string(),
   nextRunAt: z.string().nullable().optional(),
   lastRunAt: z.string().nullable().optional(),
+  lastRunStatus: z.string().optional(),
+  lastRunAgentId: z.string().optional(),
+  lastRunError: z.string().optional(),
+  runCount: z.number().int().nonnegative().default(0),
 });
 export type NativeScheduleItem = z.output<typeof NativeScheduleSchema>;
+
+export const KnownWorkspaceSchema = z.object({
+  cwd: z.string(),
+  label: z.string(),
+});
+export type KnownWorkspace = z.output<typeof KnownWorkspaceSchema>;
 
 export const BotSnapshotSchema = z.object({
   chiefAgentId: z.string().nullable(),
@@ -225,6 +243,7 @@ export const BotSnapshotSchema = z.object({
   approvals: z.array(ApprovalItemSchema),
   workers: z.array(DelegatedWorkerSchema),
   routineSuggestions: z.array(RoutineSuggestionSchema).default([]),
+  knownWorkspaces: z.array(KnownWorkspaceSchema).default([]),
   memoryContent: z.string(),
   memoryPath: z.string(),
 });
@@ -274,31 +293,98 @@ export const getBotSnapshotRpc = defineRpc({
   output: BotSnapshotSchema,
 });
 
+export const BotSummarySchema = z.object({
+  globalPaused: z.boolean(),
+  unreadCount: z.number().int().nonnegative(),
+  pendingApprovalCount: z.number().int().nonnegative(),
+  runningWorkerCount: z.number().int().nonnegative(),
+});
+export type BotSummary = z.output<typeof BotSummarySchema>;
+
 export const watchBotStateSubscription = defineSubscription({
   name: "bot.watch",
   input: z.object({}),
   event: BotSnapshotSchema,
 });
 
+export const watchBotSummarySubscription = defineSubscription({
+  name: "bot.watch_summary",
+  input: z.object({}),
+  event: BotSummarySchema,
+});
+
+export const CatalogModelSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  description: z.string().optional(),
+  isDefault: z.boolean().optional(),
+});
+export type CatalogModel = z.output<typeof CatalogModelSchema>;
+
+export const CatalogProviderSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  models: z.array(CatalogModelSchema),
+});
+export type CatalogProvider = z.output<typeof CatalogProviderSchema>;
+
+export const listModelsRpc = defineRpc({
+  name: "bot.models.list",
+  input: z.object({
+    refresh: z.boolean().optional(),
+  }),
+  output: z.object({
+    defaultProvider: z.string(),
+    providers: z.array(CatalogProviderSchema),
+  }),
+});
+
 export const ensureChiefBotRpc = defineRpc({
   name: "bot.ensure_chief",
-  input: z.object({ reset: z.boolean().optional() }),
+  input: z.object({
+    reset: z.boolean().optional(),
+    provider: z.string().optional(),
+  }),
   output: z.object({
     agentId: z.string(),
     workspaceId: z.string().nullable(),
     created: z.boolean(),
+    modelUsed: z.string().optional(),
   }),
 });
 
+export const MAX_ATTACHED_IMAGES = 6;
+export const MAX_SINGLE_IMAGE_BASE64_CHARS = 12 * 1024 * 1024;
+
+export const WishImageAttachmentSchema = z.object({
+  data: z.string().min(1).max(MAX_SINGLE_IMAGE_BASE64_CHARS),
+  mimeType: z.string().regex(/^image\/[a-zA-Z0-9.+-]+$/),
+  name: z.string().max(120).optional(),
+});
+export type WishImageAttachment = z.output<typeof WishImageAttachmentSchema>;
+
 export const submitWishRpc = defineRpc({
   name: "bot.submit_wish",
-  input: z.object({
-    wish: z.string().min(1),
-    cwd: z.string().optional(),
-  }),
+  input: z
+    .object({
+      wish: z.string().default(""),
+      images: z.array(WishImageAttachmentSchema).max(MAX_ATTACHED_IMAGES).optional(),
+      cwd: z.string().optional(),
+      provider: z.string().optional(),
+      asyncLaunch: z.boolean().optional(),
+    })
+    .refine(
+      (val) => val.wish.trim().length > 0 || (val.images !== undefined && val.images.length > 0),
+      { message: "Wish text or at least one image is required" },
+    ),
   output: z.object({
     agentId: z.string(),
     workspaceId: z.string().nullable(),
+    feedId: z.string().optional(),
+    pendingLaunch: z.boolean().optional(),
+    reusedSession: z.boolean().optional(),
+    sessionTitle: z.string().optional(),
+    modelUsed: z.string().optional(),
   }),
 });
 
@@ -359,8 +445,14 @@ export const toggleTriggerRpc = defineRpc({
 
 export const deleteTriggerRpc = defineRpc({
   name: "bot.trigger.delete",
-  input: z.object({ id: z.string() }),
-  output: z.object({ ok: z.boolean() }),
+  input: z.object({
+    id: z.string().optional(),
+    clearFinishedReminders: z.boolean().optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    removedCount: z.number().int().nonnegative().optional(),
+  }),
 });
 
 export const runTriggerNowRpc = defineRpc({
@@ -373,13 +465,21 @@ export const PresetIdSchema = z.enum([
   "kb_inbox",
   "universal_webhook",
   "morning_briefing",
+  "session_tidy",
 ]);
 export type PresetId = z.output<typeof PresetIdSchema>;
+
+export const PresetInstallResultSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  isNativeSchedule: z.boolean().optional(),
+});
+export type PresetInstallResult = z.output<typeof PresetInstallResultSchema>;
 
 export const installPresetRpc = defineRpc({
   name: "bot.trigger.install_preset",
   input: z.object({ presetId: PresetIdSchema }),
-  output: TriggerSpecSchema,
+  output: PresetInstallResultSchema,
 });
 
 export const resolveApprovalRpc = defineRpc({
@@ -403,8 +503,13 @@ export const markFeedReadRpc = defineRpc({
   input: z.object({
     id: z.string().optional(),
     clearSilent: z.boolean().optional(),
+    dismissId: z.string().optional(),
+    clearRead: z.boolean().optional(),
   }),
-  output: z.object({ ok: z.boolean() }),
+  output: z.object({
+    ok: z.boolean(),
+    removedCount: z.number().int().nonnegative().optional(),
+  }),
 });
 
 export const curateFeedRpc = defineRpc({
@@ -428,7 +533,9 @@ export const executeFeedActionRpc = defineRpc({
     actionId: z.string().optional(),
     customKind: FeedActionKindSchema.optional(),
     customPrompt: z.string().optional(),
+    images: z.array(WishImageAttachmentSchema).max(MAX_ATTACHED_IMAGES).optional(),
     delayMinutes: z.number().min(1).max(60 * 24 * 14).optional(),
+    fallbackProvider: z.string().optional(),
   }),
   output: z.object({
     ok: z.boolean(),
@@ -457,11 +564,33 @@ export const manageWorkerRpc = defineRpc({
   }),
 });
 
+export const NativeScheduleUpsertInputSchema = z.object({
+  id: z.string().optional(),
+  name: z.string().min(1),
+  prompt: z.string().min(1),
+  cwd: z.string().optional(),
+  dailyTime: z.string().optional(),
+  cron: z.string().optional(),
+  timezone: z.string().optional(),
+  everySec: z.number().int().min(60).max(86_400 * 7).optional(),
+  governance: GovernanceLevelSchema.optional(),
+  noiseRules: z.array(z.string()).optional(),
+  provider: z.string().optional(),
+  enabled: z.boolean().optional(),
+});
+export type NativeScheduleUpsertInput = z.output<typeof NativeScheduleUpsertInputSchema>;
+
+export const upsertNativeScheduleRpc = defineRpc({
+  name: "bot.native_schedule.upsert",
+  input: NativeScheduleUpsertInputSchema,
+  output: NativeScheduleSchema,
+});
+
 export const manageNativeScheduleRpc = defineRpc({
   name: "bot.native_schedule.manage",
   input: z.object({
     id: z.string().min(1),
-    action: z.enum(["run_once", "pause", "resume"]),
+    action: z.enum(["run_once", "pause", "resume", "delete"]),
   }),
   output: z.object({
     ok: z.boolean(),
@@ -479,4 +608,21 @@ export const setGlobalPauseRpc = defineRpc({
   name: "bot.set_pause",
   input: z.object({ paused: z.boolean() }),
   output: z.object({ paused: z.boolean() }),
+});
+
+export const tidySessionsRpc = defineRpc({
+  name: "bot.sessions.tidy",
+  input: z.object({
+    mode: z.enum(["preview", "apply"]).default("preview"),
+    idleHours: z.number().int().min(0).max(720).optional(),
+    closedHours: z.number().int().min(0).max(720).optional(),
+    ensurePinnedHubs: z.boolean().optional(),
+    callerAgentId: z.string().optional(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    actionCount: z.number().int().nonnegative(),
+    approvalId: z.string().optional(),
+    summary: z.string(),
+  }),
 });

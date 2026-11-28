@@ -36,10 +36,10 @@ export function registerBotAgentTools(
   const createTriggerTool = defineAgentTool({
     name: "paseo_bot_create_trigger",
     description:
-      "Create or update a persistent Paseo Bot trigger (file_watch, webhook, poll_command, or schedule).",
+      "Create or update a persistent Paseo Bot rule or unified Paseo schedule (file_watch, webhook, poll_command, or schedule — schedules are automatically unified with Paseo Sidebar Schedules).",
     input: z.object({
-      id: z.string().optional().describe("Existing trigger ID when updating"),
-      name: z.string().min(1).describe("Mission name"),
+      id: z.string().optional().describe("Existing trigger or schedule ID when updating"),
+      name: z.string().min(1).describe("Mission or schedule name"),
       kind: TriggerKindSchema.describe("file_watch | webhook | poll_command | schedule | self_wake"),
       governance: GovernanceLevelSchema.optional().describe("autonomous | notify | require_approval"),
       cwd: z.string().optional().describe("Workspace directory"),
@@ -48,13 +48,45 @@ export function registerBotAgentTools(
       pollCommand: z.string().optional().describe("Shell command or URL for poll_command"),
       pollIntervalSec: z.number().int().min(10).max(604800).optional().describe("Seconds interval"),
       dailyTime: z.string().optional().describe("Daily local HH:mm for schedule, e.g. 09:00"),
+      cron: z
+        .string()
+        .optional()
+        .describe("Optional 5-field cron expression for kind='schedule', e.g. '30 9,21 * * *'"),
+      timezone: z
+        .string()
+        .optional()
+        .describe("Optional IANA timezone for kind='schedule', defaults to local timezone"),
       matchRegex: z.string().optional().describe("Optional regex filter"),
     }),
     async execute(input, { agent, paseo }) {
       engine.attachPaseo(paseo);
+      const resolvedCwd = input.cwd || agent.cwd || engine.getSettings().homeCwd;
+
+      if (input.kind === "schedule") {
+        const isLegacyTriggerId = Boolean(input.id?.startsWith("trg_"));
+        const sched = await engine.upsertNativeSchedule({
+          id: input.id && !isLegacyTriggerId ? input.id : undefined,
+          name: input.name,
+          prompt: input.prompt,
+          cwd: resolvedCwd,
+          dailyTime: input.dailyTime,
+          cron: input.cron,
+          timezone: input.timezone,
+          everySec: input.pollIntervalSec,
+          governance: input.governance ?? "notify",
+        });
+        if (isLegacyTriggerId && input.id) {
+          await engine.deleteTrigger(input.id);
+        }
+        return {
+          text: `Saved unified Paseo schedule '${sched.name}' (id: ${sched.id}, cadence: ${sched.cadence}, status: ${sched.status}). Synced across both Paseo Sidebar Schedules and Paseo Bot.`,
+          structuredContent: { schedule: sched },
+        };
+      }
+
       const saved = await engine.upsertTrigger({
         ...input,
-        cwd: input.cwd || agent.cwd || engine.getSettings().homeCwd,
+        cwd: resolvedCwd,
       });
       const webhookBaseUrl = engine.getWebhookBaseUrl();
       const webhookUrl =
@@ -76,7 +108,7 @@ export function registerBotAgentTools(
   const listTriggersTool = defineAgentTool({
     name: "paseo_bot_list_triggers",
     description:
-      "List all Paseo Bot proactive triggers, delegated workers, pending Sentinel approvals, and wake budget status.",
+      "List all unified Paseo schedules, Paseo Bot event/diff triggers, delegated workers, pending Sentinel approvals, and wake budget status.",
     input: z.object({}),
     async execute(_input, { paseo }) {
       engine.attachPaseo(paseo);
@@ -87,6 +119,18 @@ export function registerBotAgentTools(
             globalPaused: snap.globalPaused,
             hourlyWakes: `${snap.hourlyWakesUsed}/${snap.hourlyWakeLimit}`,
             webhookBaseUrl: snap.webhookBaseUrl,
+            schedules: snap.nativeSchedules.map((s) => ({
+              id: s.id,
+              name: s.name,
+              cadence: s.cadence,
+              cwd: s.cwd,
+              provider: s.provider,
+              status: s.status,
+              nextRunAt: s.nextRunAt,
+              lastRunAt: s.lastRunAt,
+              lastRunStatus: s.lastRunStatus,
+              runCount: s.runCount,
+            })),
             triggers: snap.triggers.map((t) => ({
               id: t.id,
               name: t.name,
@@ -114,17 +158,37 @@ export function registerBotAgentTools(
 
   const updateTriggerTool = defineAgentTool({
     name: "paseo_bot_update_trigger",
-    description: "Enable, pause, or run a Paseo Bot trigger immediately by ID.",
+    description: "Enable, pause, or run a unified Paseo schedule or Paseo Bot trigger immediately by ID.",
     input: z.object({
-      id: z.string().describe("Trigger ID"),
-      enabled: z.boolean().optional().describe("Set true to enable, false to pause"),
+      id: z.string().describe("Schedule ID or Trigger ID"),
+      enabled: z.boolean().optional().describe("Set true to enable/resume, false to pause"),
       runNow: z.boolean().optional().describe("Set true to trigger an immediate evaluation run"),
     }),
     async execute({ id, enabled, runNow }, { paseo }) {
       engine.attachPaseo(paseo);
+      const snap = await engine.getSnapshot({ includeMemory: false });
+      const isNative = snap.nativeSchedules.some((s) => s.id === id);
+      if (isNative) {
+        const messages: string[] = [];
+        if (enabled !== undefined) {
+          const res = await engine.manageNativeSchedule({
+            id,
+            action: enabled ? "resume" : "pause",
+          });
+          if (!res.ok) return { isError: true, text: res.message };
+          messages.push(res.message);
+        }
+        if (runNow) {
+          const res = await engine.manageNativeSchedule({ id, action: "run_once" });
+          if (!res.ok) return { isError: true, text: res.message };
+          messages.push(res.message);
+        }
+        return { text: messages.join(" · ") || `Updated schedule ${id}.` };
+      }
+
       if (enabled !== undefined) {
         const ok = await engine.toggleTrigger(id, enabled);
-        if (!ok) return { isError: true, text: `Trigger ${id} not found.` };
+        if (!ok) return { isError: true, text: `Trigger or schedule ${id} not found.` };
       }
       if (runNow) {
         const res = await engine.dispatchTrigger(id, {
@@ -140,15 +204,21 @@ export function registerBotAgentTools(
 
   const deleteTriggerTool = defineAgentTool({
     name: "paseo_bot_delete_trigger",
-    description: "Permanently delete a Paseo Bot trigger by ID.",
+    description: "Permanently delete a unified Paseo schedule or Paseo Bot trigger by ID.",
     input: z.object({
-      id: z.string().describe("Trigger ID to remove"),
+      id: z.string().describe("Schedule ID or Trigger ID to remove"),
     }),
     async execute({ id }, { paseo }) {
       engine.attachPaseo(paseo);
       const ok = await engine.deleteTrigger(id);
-      if (!ok) return { isError: true, text: `Trigger ${id} not found.` };
-      return { text: `Deleted trigger ${id}.` };
+      if (ok) return { text: `Deleted trigger ${id}.` };
+
+      const snap = await engine.getSnapshot({ includeMemory: false });
+      if (snap.nativeSchedules.some((s) => s.id === id)) {
+        const res = await engine.manageNativeSchedule({ id, action: "delete" });
+        return { text: res.ok ? `Deleted schedule ${id}.` : res.message, isError: !res.ok };
+      }
+      return { isError: true, text: `Trigger or schedule ${id} not found.` };
     },
   });
 
@@ -374,12 +444,67 @@ export function registerBotAgentTools(
     },
   });
 
+  const tidySessionsTool = defineAgentTool({
+    name: "paseo_bot_tidy_sessions",
+    description:
+      "Scan active Paseo workspaces and sessions to normalize messy titles ([Category] Summary), merge duplicate same-topic threads (preserving context in the latest session + optional Obsidian digest), pin canonical directory hub workspaces, and archive stale/empty shells. Defaults to mode='preview' which stages an interactive Sentinel checklist card for user confirmation.",
+    input: z.object({
+      mode: z
+        .enum(["preview", "apply"])
+        .default("preview")
+        .describe("preview = stage interactive checklist in Paseo Bot Confirmations (recommended); apply = execute immediately"),
+      idleHours: z
+        .number()
+        .int()
+        .min(0)
+        .max(720)
+        .optional()
+        .describe("Archive unpinned idle sessions older than N hours (default from settings, 24h)"),
+      closedHours: z
+        .number()
+        .int()
+        .min(0)
+        .max(720)
+        .optional()
+        .describe("Archive exited/closed sessions older than N hours (default 8h)"),
+      ensurePinnedHubs: z
+        .boolean()
+        .optional()
+        .describe("Pin one canonical hub workspace for local directories that have >=3 fragmented workspaces"),
+    }),
+    async execute({ mode, idleHours, closedHours, ensurePinnedHubs }, { agent, paseo }) {
+      engine.attachPaseo(paseo);
+      const res = await engine.tidySessions({
+        mode,
+        idleHours,
+        closedHours,
+        ensurePinnedHubs,
+        callerAgentId: agent.background ? undefined : agent.id,
+      });
+      if (agent.background && mode === "preview" && res.approvalId) {
+        engine.recordScoutOutcome(agent.id, {
+          level: "approval_required",
+          title: "工作区与会话整理预览",
+          summary: res.summary,
+        });
+      }
+      return {
+        text: res.approvalId
+          ? `${res.summary}\n已生成待确认整理清单（Approval ID: ${res.approvalId}），用户可在 Paseo Bot「待确认」面板或卡片中勾选/微调后一键执行。`
+          : res.summary,
+        structuredContent: res,
+        isError: !res.ok,
+      };
+    },
+  });
+
   const scoutTools = [
     reportOutcomeTool,
     requestApprovalTool,
     selfWakeTool,
     memoryReadTool,
     memoryWriteTool,
+    tidySessionsTool,
   ];
 
   const fullTools = [
@@ -393,11 +518,20 @@ export function registerBotAgentTools(
     requestApprovalTool,
     memoryReadTool,
     memoryWriteTool,
+    tidySessionsTool,
   ];
 
   return server.addHook("agent.open.before", async ({ request }, { paseo }) => {
     engine.attachPaseo(paseo);
     if (request.purpose === "history") return;
+
+    const mergedDigest =
+      typeof request.metadata?.["paseo-bot.mergedDigest"] === "string"
+        ? request.metadata["paseo-bot.mergedDigest"].trim()
+        : "";
+    const mergedPromptBlock = mergedDigest
+      ? `[Prior Merged Same-Topic Sessions]\nThe following earlier sessions on the same topic were archived and merged into this session:\n\n${mergedDigest}`
+      : "";
 
     const role = request.labels["paseo-bot/role"];
     if (role === "scout") {
@@ -409,16 +543,21 @@ export function registerBotAgentTools(
 
     if (role === "chief") {
       const memPath = engine.getSettings().memoryFilePath;
-      const memory = await engine.store.readMemory(memPath);
-      const state = engine.store.get();
+      const [memory, snap] = await Promise.all([
+        engine.store.readMemory(memPath),
+        engine.getSnapshot({ includeMemory: false }),
+      ]);
+      let activeSchedules = 0;
+      for (const s of snap.nativeSchedules) if (s.status === "active") activeSchedules += 1;
       let activeTriggers = 0;
-      for (const t of state.triggers) if (t.enabled) activeTriggers += 1;
+      for (const t of snap.triggers) if (t.enabled) activeTriggers += 1;
       let runningWorkers = 0;
-      for (const w of state.workers) if (w.status === "running") runningWorkers += 1;
+      for (const w of snap.workers) if (w.status === "running") runningWorkers += 1;
       let pendingApprovals = 0;
-      for (const a of state.approvals) if (a.status === "pending") pendingApprovals += 1;
+      for (const a of snap.approvals) if (a.status === "pending") pendingApprovals += 1;
       const activeSummary = [
-        `Active Paseo Bot Triggers: ${activeTriggers}`,
+        `Unified Paseo Schedules: ${activeSchedules}`,
+        `Event/Diff Triggers: ${activeTriggers}`,
         `Running Delegated Workers: ${runningWorkers}`,
         `Pending Sentinel Approvals: ${pendingApprovals}`,
       ].join(" | ");
@@ -428,6 +567,7 @@ export function registerBotAgentTools(
         tools: [...request.tools, ...fullTools],
         appendSystemPrompt: [
           ...(request.appendSystemPrompt ?? []),
+          ...(mergedPromptBlock ? [mergedPromptBlock] : []),
           [
             `[Paseo Bot Live State] ${activeSummary}`,
             `Note: All \`paseo_bot_*\` tools belong to the \`paseo\` MCP server (if a tool such as \`paseo_bot_create_trigger\` is lazy-loaded in your harness, call it via \`call_mcp_tool\` with ServerName="paseo" — no need to inspect plugin source files). Default model preference: \`antigravity/gemini-4-neon\`.`,
@@ -443,8 +583,16 @@ export function registerBotAgentTools(
         tools: [...request.tools, ...fullTools],
         appendSystemPrompt: [
           ...(request.appendSystemPrompt ?? []),
-          "Paseo Bot tools (`paseo_bot_*`) are available: if the user asks to set up a proactive monitor/trigger, schedule a self-wake check, delegate background work, or save long-term preferences, use the `paseo_bot_*` tools directly.",
+          ...(mergedPromptBlock ? [mergedPromptBlock] : []),
+          "Paseo Bot tools (`paseo_bot_*`) are available: if the user asks to set up a proactive monitor/trigger, schedule a self-wake check, delegate background work, tidy/merge/archive sessions (`paseo_bot_tidy_sessions`), or save long-term preferences, use the `paseo_bot_*` tools directly.",
         ],
+      };
+    }
+
+    if (mergedPromptBlock) {
+      return {
+        ...request,
+        appendSystemPrompt: [...(request.appendSystemPrompt ?? []), mergedPromptBlock],
       };
     }
 

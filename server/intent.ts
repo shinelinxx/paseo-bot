@@ -9,8 +9,72 @@ import type {
   MissionDraft,
   RoutineSuggestion,
   TriggerKind,
+  WishImageAttachment,
 } from "../shared/contracts";
 import { createShortId, expandHomePath, type PersistedBotState } from "./storage.ts";
+
+export function normalizeAgentImages(
+  images?: readonly WishImageAttachment[],
+): Array<{ data: string; mimeType: string }> {
+  if (!images || images.length === 0) return [];
+  const out: Array<{ data: string; mimeType: string }> = [];
+  for (const img of images) {
+    const rawData = img.data.trim();
+    if (!rawData) continue;
+    const dataUrlMatch = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(rawData);
+    const mimeType = (dataUrlMatch?.[1] || img.mimeType || "image/png").trim().toLowerCase();
+    const base64 = (dataUrlMatch?.[2] || rawData).replace(/\s+/g, "");
+    if (!base64 || !mimeType.startsWith("image/")) continue;
+    out.push({ data: base64, mimeType });
+  }
+  return out;
+}
+
+export function formatImageSummaryTag(count: number): string {
+  if (count <= 0) return "";
+  return count === 1 ? "[附 1 张图片]" : `[附 ${count} 张图片]`;
+}
+
+export function resolveWishSubmissionContent(input: {
+  wish: string;
+  images?: readonly WishImageAttachment[];
+  titleOverride?: string;
+}): {
+  cleanWish: string;
+  attachedImages: Array<{ data: string; mimeType: string }>;
+  effectiveWishText: string;
+  feedSummaryText: string;
+  baseLabel: string;
+} {
+  const cleanWish = input.wish.trim();
+  const attachedImages = normalizeAgentImages(input.images);
+  const imageTag = formatImageSummaryTag(attachedImages.length);
+  const effectiveWishText =
+    cleanWish ||
+    (attachedImages.length === 1
+      ? "请查看附带的图片并按需分析或处理。"
+      : `请查看附带的 ${attachedImages.length} 张图片并按需分析或处理。`);
+  const feedSummaryText = cleanWish
+    ? imageTag
+      ? `${cleanWish}\n\n${imageTag}`
+      : cleanWish
+    : imageTag;
+  const baseLabel =
+    input.titleOverride?.trim() ||
+    (cleanWish
+      ? cleanTaskTitle(cleanWish).replace(/\s+/g, " ").slice(0, 26) +
+        (cleanWish.length > 26 ? "…" : "")
+      : attachedImages.length === 1
+        ? "图片任务"
+        : `${attachedImages.length} 张图片任务`);
+  return {
+    cleanWish,
+    attachedImages,
+    effectiveWishText,
+    feedSummaryText,
+    baseLabel,
+  };
+}
 
 const CHINESE_NUMERALS: Record<string, number> = {
   零: 0,
@@ -104,11 +168,91 @@ export function extractIntervalSec(intent: string): number | undefined {
   return undefined;
 }
 
+const GENERIC_WORKSPACE_KEYWORDS = new Set([
+  "日常",
+  "通用",
+  "日常通用任务",
+  "通用任务",
+  "任务",
+  "工作区",
+  "目录",
+  "项目",
+  "个人",
+  "默认",
+  "源码",
+  "插件",
+  "自动化",
+  "workspace",
+  "project",
+  "general",
+  "default",
+  "documents",
+  "users",
+]);
+
+function extractWorkspaceKeywordsFromLabel(label: string): string[] {
+  const clean = label
+    .replace(/[*`'"「」《》()（）]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!clean) return [];
+  const results = new Set<string>();
+  const segments = clean
+    .split(/[/／、，,|｜·：:;；]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (const seg of segments) {
+    const lowerSeg = seg.toLowerCase();
+    if (!GENERIC_WORKSPACE_KEYWORDS.has(lowerSeg)) {
+      const hasCjk = /[\u4e00-\u9fa5]/.test(seg);
+      if ((hasCjk && seg.length >= 2) || (!hasCjk && seg.length >= 3)) {
+        results.add(lowerSeg);
+      }
+    }
+    const asciiMatches = seg.match(/[A-Za-z][A-Za-z0-9_-]{2,32}/g) ?? [];
+    for (const token of asciiMatches) {
+      const lowerTok = token.toLowerCase();
+      if (!GENERIC_WORKSPACE_KEYWORDS.has(lowerTok) && lowerTok !== "paseo") {
+        results.add(lowerTok);
+      }
+    }
+  }
+  return [...results];
+}
+
+export function extractMemoryWorkspaceHints(
+  memoryContent: string,
+): Array<{ cwd: string; label: string; keywords: string[] }> {
+  if (!memoryContent.trim()) return [];
+  const results: Array<{ cwd: string; label: string; keywords: string[] }> = [];
+  const seen = new Set<string>();
+  const lineRe =
+    /^\s*[-*]\s+\*{0,2}([^：:\n`]{2,48}?)\*{0,2}\s*[：:]\s*`?((?:~\/|\/Users\/|\/home\/|\/opt\/)[^`\s（()）,，。；;]+)`?/gm;
+  let match: RegExpExecArray | null;
+  while ((match = lineRe.exec(memoryContent)) !== null) {
+    const rawLabel = match[1].trim();
+    const rawPath = match[2].trim().replace(/[.,;:]+$/, "");
+    if (!rawPath) continue;
+    const resolved = path.resolve(expandHomePath(rawPath));
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    results.push({
+      cwd: resolved,
+      label: rawLabel,
+      keywords: extractWorkspaceKeywordsFromLabel(rawLabel),
+    });
+  }
+  return results;
+}
+
 export function inferWorkspaceAndWatchPath(
   intent: string,
   defaultCwd: string,
+  knownWorkspaces: readonly { cwd: string; label: string }[] = [],
+  memoryContent = "",
 ): { cwd: string; watchPath?: string } {
-  const resolvedDefault = expandHomePath(defaultCwd);
+  const resolvedDefault = path.resolve(expandHomePath(defaultCwd));
 
   const pathMatch = /(?:^|\s)((?:~\/|\/Users\/|\/home\/|\/tmp\/|\/var\/|\/opt\/)[^\s,，。；;'"`]+)/.exec(
     intent,
@@ -118,10 +262,96 @@ export function inferWorkspaceAndWatchPath(
     return { cwd: resolved, watchPath: resolved };
   }
 
+  // Merge known workspaces and MEMORY.md workspace map hints into unified candidates
+  const candidateMap = new Map<
+    string,
+    { cwd: string; labels: Set<string>; keywords: Set<string> }
+  >();
+  const addCandidate = (cwdRaw: string, label?: string, extraKeywords: readonly string[] = []) => {
+    const norm = path.resolve(expandHomePath(cwdRaw));
+    const entry = candidateMap.get(norm) ?? {
+      cwd: norm,
+      labels: new Set<string>(),
+      keywords: new Set<string>(),
+    };
+    if (label?.trim()) entry.labels.add(label.trim());
+    for (const kw of extraKeywords) entry.keywords.add(kw);
+    candidateMap.set(norm, entry);
+  };
+
+  for (const ws of knownWorkspaces) {
+    addCandidate(ws.cwd, ws.label, extractWorkspaceKeywordsFromLabel(ws.label));
+  }
+  for (const hint of extractMemoryWorkspaceHints(memoryContent)) {
+    addCandidate(hint.cwd, hint.label, hint.keywords);
+  }
+
+  const lowerIntent = intent.toLowerCase();
+  let bestCwd: string | null = null;
+  let bestScore = 0;
+
+  for (const cand of candidateMap.values()) {
+    let score = 0;
+    const base = path.basename(cand.cwd).toLowerCase();
+    const spacedBase = base.replace(/[-_]+/g, " ");
+    if (base.length >= 3 && !GENERIC_WORKSPACE_KEYWORDS.has(base)) {
+      if (lowerIntent.includes(base)) {
+        score = Math.max(score, 100 + base.length);
+      } else if (
+        spacedBase !== base &&
+        spacedBase.length >= 5 &&
+        lowerIntent.includes(spacedBase)
+      ) {
+        score = Math.max(score, 95 + spacedBase.length);
+      }
+    }
+
+    for (const label of cand.labels) {
+      const lowerLabel = label.toLowerCase();
+      if (
+        lowerLabel.length >= 2 &&
+        !GENERIC_WORKSPACE_KEYWORDS.has(lowerLabel) &&
+        lowerIntent.includes(lowerLabel)
+      ) {
+        score = Math.max(score, 85 + lowerLabel.length);
+      }
+    }
+
+    for (const kw of cand.keywords) {
+      if (lowerIntent.includes(kw)) {
+        const isAscii = /^[a-z0-9_-]+$/i.test(kw);
+        const matched = isAscii
+          ? new RegExp(`(?:^|[^a-z0-9_-])${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-z0-9_-])`, "i").test(
+              lowerIntent,
+            )
+          : true;
+        if (matched) {
+          score = Math.max(score, 70 + kw.length);
+        }
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCwd = cand.cwd;
+    }
+  }
+
+  if (bestCwd && bestScore > 0) {
+    if (/00-inbox|收件箱草稿|收件箱笔记/i.test(intent) && bestCwd === resolvedDefault) {
+      return { cwd: bestCwd, watchPath: path.join(bestCwd, "00-Inbox") };
+    }
+    return { cwd: bestCwd };
+  }
+
   const homeDocs = path.join(os.homedir(), "Documents");
+  if (/\bpaseo[\s_-]?bot\b/i.test(intent)) {
+    return { cwd: path.join(homeDocs, "paseo", "paseo-bot") };
+  }
+
   // Match ~/Documents/<ProjectName> when an explicit CamelCase/hyphenated project name is mentioned
   const docProjMatch = /\b([A-Z][A-Za-z0-9_-]{2,30})\b/.exec(intent);
-  if (docProjMatch && !/^(HTTP|HTTPS|JSON|HTML|YAML|UTF|SHA|API|URL|PDF|CSV)$/i.test(docProjMatch[1])) {
+  if (docProjMatch && !/^(HTTP|HTTPS|JSON|HTML|YAML|UTF|SHA|API|URL|PDF|CSV|Paseo)$/i.test(docProjMatch[1])) {
     const candidate = docProjMatch[1];
     if (/00-inbox/i.test(intent)) {
       const kb = resolvedDefault.includes("KnowledgeBase")
@@ -172,11 +402,18 @@ function buildShortMissionName(intent: string, kind: TriggerKind, dailyTime?: st
   return `${cleaned.slice(0, 20)}…`;
 }
 
-export function draftMissionFromIntent(intent: string, defaultCwd: string): MissionDraft {
+export function draftMissionFromIntent(
+  intent: string,
+  defaultCwd: string,
+  knownWorkspaces: readonly { cwd: string; label: string }[] = [],
+  memoryContent = "",
+): MissionDraft {
   const cleanIntent = intent.trim();
   const { cwd, watchPath: inferredWatchPath } = inferWorkspaceAndWatchPath(
     cleanIntent,
     defaultCwd,
+    knownWorkspaces,
+    memoryContent,
   );
   const governance = inferGovernance(cleanIntent);
   const dailyTime = extractDailyTime(cleanIntent);
@@ -418,6 +655,21 @@ export function applyApprovalResolutionMutation(
   const target: ApprovalItem = { ...found };
   let promotedTriggerName: string | undefined;
 
+  // Sync any corresponding Inbox feed card so "待确认：..." doesn't stay unread/stale after decision
+  for (const f of draft.feed) {
+    if (
+      f.approvalId === found.id ||
+      (f.level === "approval_required" && f.title === `待确认：${found.title}`)
+    ) {
+      f.unread = false;
+      f.level = "notify";
+      f.title =
+        input.decision === "approved"
+          ? `已确认：${found.title}`
+          : `已拒绝：${found.title}`;
+    }
+  }
+
   if (found.triggerId) {
     const trg = draft.triggers.find((t) => t.id === found.triggerId);
     if (trg) {
@@ -496,18 +748,40 @@ export function splitReplyIntoPreviewAndDetails(
   };
 }
 
+const RETROSPECTIVE_HEADING_RE =
+  /(已完成|已修改|已执行|已修复|已归档|已清理|改动明细|修改明细|变更明细|精简明细|优化明细|执行结果|处理结果|根因|原因分析|核心症结|问题分析|汇总对比|方案对比|completed|changes made|summary of changes|root cause)/i;
+
+const ACTIONABLE_CONTEXT_RE =
+  /(待处理|待办|待确认|需处理|需确认|需要你|需人工|下一步|后续建议|可选操作|建议跟进|todo|to-do|action items?|next steps?|pending|follow[- ]?ups?)/i;
+
+function normalizeDirectoryHint(rawPath: string | undefined): string | undefined {
+  if (!rawPath) return undefined;
+  const base = path.basename(rawPath);
+  if (/\.[a-z0-9]{1,8}$/i.test(base)) {
+    return path.dirname(rawPath);
+  }
+  return rawPath;
+}
+
 export function extractSuggestedActionsFromMarkdown(markdown: string): FeedAction[] {
   if (!markdown || markdown.length < 30) return [];
   const actions: FeedAction[] = [];
   const seenLabels = new Set<string>();
 
-  // Split by numbered bold items or bullet bold items so we can also inspect each item's body lines for session/path hints
-  const itemHeaderRegex = /(?:^|\n)[ \t]*(?:\d+\.|[-*])[ \t]+\*\*([^*]{4,72})\*\*/g;
-  const matches: Array<{ headline: string; startIdx: number; bodyStartIdx: number }> = [];
+  // Match numbered/bullet bold items (with optional Markdown task checkbox)
+  const itemHeaderRegex =
+    /(?:^|\n)[ \t]*(?:\d+\.|[-*])[ \t]+(?:\[([ xX])\][ \t]+)?\*\*([^*]{4,72})\*\*/g;
+  const matches: Array<{
+    checkboxState?: string;
+    headline: string;
+    startIdx: number;
+    bodyStartIdx: number;
+  }> = [];
   let match: RegExpExecArray | null;
   while ((match = itemHeaderRegex.exec(markdown)) !== null) {
     matches.push({
-      headline: match[1].trim(),
+      checkboxState: match[1],
+      headline: match[2].trim(),
       startIdx: match.index,
       bodyStartIdx: match.index + match[0].length,
     });
@@ -515,6 +789,37 @@ export function extractSuggestedActionsFromMarkdown(markdown: string): FeedActio
 
   for (let i = 0; i < matches.length; i += 1) {
     const current = matches[i];
+    // Skip explicitly checked-off items: - [x] **...**
+    if (current.checkboxState && current.checkboxState.toLowerCase() === "x") {
+      continue;
+    }
+
+    // Inspect nearest preceding section heading and lead-in text before this list
+    const beforeText = markdown.slice(0, current.startIdx);
+    const headingMatches = [...beforeText.matchAll(/(?:^|\n)#{1,4}[ \t]+([^\n]+)/g)];
+    const nearestHeading =
+      headingMatches.length > 0 ? headingMatches[headingMatches.length - 1][1].trim() : "";
+    const recentLeadIn = beforeText.slice(Math.max(0, beforeText.length - 220));
+
+    if (
+      nearestHeading &&
+      RETROSPECTIVE_HEADING_RE.test(nearestHeading) &&
+      !ACTIONABLE_CONTEXT_RE.test(nearestHeading)
+    ) {
+      continue;
+    }
+
+    const isUncheckedTask = current.checkboxState === " ";
+    const hasExplicitActionContext =
+      isUncheckedTask ||
+      ACTIONABLE_CONTEXT_RE.test(nearestHeading) ||
+      ACTIONABLE_CONTEXT_RE.test(recentLeadIn) ||
+      /^(?:待确认|待处理|请确认|需确认|建议跟进|下一步)[：:\s]/u.test(current.headline);
+
+    if (!hasExplicitActionContext) {
+      continue;
+    }
+
     const nextStart = i + 1 < matches.length ? matches[i + 1].startIdx : markdown.length;
     const itemBlock = markdown.slice(current.bodyStartIdx, Math.min(nextStart, current.bodyStartIdx + 800));
 
@@ -526,7 +831,17 @@ export function extractSuggestedActionsFromMarkdown(markdown: string): FeedActio
     if (!rawHeadline) continue;
     if (/(人机验证|CAPTCHA|扫码登录|手动登录)/i.test(rawHeadline)) continue;
 
+    // Reject completed / past-tense headlines or static UI/log nouns
     if (
+      /^(?:已|完成：|已完成|无需|不用)/u.test(rawHeadline) ||
+      /(已完成|已归档|已修复|已更新|已合并|已移除|已清理|已解决|已生效)/u.test(rawHeadline) ||
+      /(审批卡|动态卡|面板|明细|对比|架构|原理)$/u.test(rawHeadline)
+    ) {
+      continue;
+    }
+
+    if (
+      !isUncheckedTask &&
       !/(确认|核对|归档|整理|修复|更新|同步|删除|清理|增加|添加|开启|关闭|检查|处理|发送|生成|升级)/u.test(
         rawHeadline,
       )
@@ -548,7 +863,7 @@ export function extractSuggestedActionsFromMarkdown(markdown: string): FeedActio
       kind: "wish",
       prompt: `请直接跟进并处理这项待办：「${current.headline}」`,
       targetAgentId: sessionHints[0],
-      cwd: pathHints[0],
+      cwd: normalizeDirectoryHint(pathHints[0]),
     });
     if (actions.length >= 3) break;
   }
@@ -895,6 +1210,93 @@ export function routeFollowUpCandidate(input: {
   // 4. Fallback to the origin session that produced the card
   if (fallback) {
     return makeDecision(fallback, "origin_card_session");
+  }
+
+  return null;
+}
+
+const DIRECT_CONV_HINT_RE = /conversation:\/\/[0-9a-fA-F]{7,36}(?:-[0-9a-fA-F]{4,12})*/;
+const DIRECT_LABELED_SESSION_RE =
+  /(?:子?会话|session|agent)\s*[：:（(\s`'"「]*[0-9a-fA-F]{7,36}(?:-[0-9a-fA-F]{4,12})*/i;
+const DIRECT_UUID_RE =
+  /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/;
+const DIRECT_WORKSPACE_TITLE_RE =
+  /(?:工作区|workspace)\s*[「“"'《](?=[^」”"'》\n]*[^」”"'》\n\s])[^」”"'》\n]{2,80}[」”"'》]/i;
+
+/**
+ * Fast regex pre-check for whether a top-level wish explicitly references a session ID,
+ * `conversation://` link, UUID, or quoted workspace title (e.g. `工作区「xxx」`).
+ * Used to skip expensive `agents.list()` + `workspaces.list()` IPC calls on normal wishes.
+ */
+export function hasDirectSessionReferenceHint(text: string): boolean {
+  if (!text) return false;
+  return (
+    DIRECT_CONV_HINT_RE.test(text) ||
+    DIRECT_LABELED_SESSION_RE.test(text) ||
+    DIRECT_UUID_RE.test(text) ||
+    DIRECT_WORKSPACE_TITLE_RE.test(text)
+  );
+}
+
+/**
+ * Fast regex pre-check for whether a wish explicitly references an existing session
+ * (conversation://, session/agent ID prefix, UUID, or quoted workspace title).
+ * Used to skip expensive agents.list + workspaces.list IPC calls for ordinary wishes.
+ */
+export function hasDirectSessionReference(text: string): boolean {
+  if (!text) return false;
+  return (
+    extractSessionIdHints(text).length > 0 ||
+    extractWorkspaceTitleHints(text).length > 0
+  );
+}
+
+/**
+ * Locate an existing session explicitly referenced in a top-level wish
+ * (via conversation://<id>, session/agent ID prefix, UUID, or quoted workspace title).
+ * Intentionally avoids loose fuzzy routing so fresh wishes start clean new sessions.
+ */
+export function routeDirectWishToSession(input: {
+  wish: string;
+  candidates: readonly RoutableAgentCandidate[];
+}): FollowUpRouteDecision | null {
+  const usable = input.candidates.filter((c) => !c.isBackground);
+  if (usable.length === 0) return null;
+
+  const makeDecision = (
+    chosen: RoutableAgentCandidate,
+    reason: string,
+  ): FollowUpRouteDecision => ({
+    agentId: chosen.id,
+    title: chosen.workspaceTitle || chosen.title || chosen.projectName || chosen.id.slice(0, 8),
+    cwd: chosen.cwd,
+    workspaceId: chosen.workspaceId,
+    routedAwayFromOrigin: true,
+    reason,
+  });
+
+  const sessionHints = extractSessionIdHints(input.wish);
+  for (const hint of sessionHints) {
+    const matched = findAgentByIdOrPrefix(hint, usable);
+    if (matched) {
+      return makeDecision(matched, `direct_wish_session_id:${hint}`);
+    }
+  }
+
+  const wsHints = extractWorkspaceTitleHints(input.wish);
+  for (const wsTitle of wsHints) {
+    const lowerWs = wsTitle.toLowerCase();
+    const wsMatches = usable
+      .filter(
+        (c) =>
+          c.workspaceTitle?.toLowerCase() === lowerWs ||
+          c.title.toLowerCase() === lowerWs ||
+          c.workspaceTitle?.toLowerCase().includes(lowerWs),
+      )
+      .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+    if (wsMatches[0]) {
+      return makeDecision(wsMatches[0], `direct_wish_workspace:${wsTitle}`);
+    }
   }
 
   return null;

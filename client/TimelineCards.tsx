@@ -3,8 +3,14 @@ import {
   useTranslation,
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
-import { Icon, Markdown, TextInput, useToast } from "@getpaseo/plugin/client/ui";
-import { memo, useCallback, useState } from "react";
+import {
+  copyText,
+  Icon,
+  Markdown,
+  TextInput,
+  useToast,
+} from "@getpaseo/plugin/client/ui";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import {
   curateFeedRpc,
@@ -15,7 +21,9 @@ import {
   type BotApprovalTimelineData,
   type FeedAction,
 } from "../shared/contracts";
+import { formatSmartTime, minutesUntilTomorrowMorning } from "./helpers";
 import { messages } from "./i18n";
+import { optimisticCurateFeed, optimisticResolveApproval } from "./store";
 
 const baseStyles = StyleSheet.create({
   alertCard: {
@@ -92,6 +100,13 @@ const baseStyles = StyleSheet.create({
     minHeight: 84,
     fontSize: 12,
   },
+  actionFooterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 6,
+  },
   chipRow: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -107,6 +122,14 @@ const baseStyles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
   },
+  moreIconBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   microBtnText: {
     fontSize: 12,
     fontWeight: "600",
@@ -114,6 +137,12 @@ const baseStyles = StyleSheet.create({
   actionsBlock: {
     gap: 8,
     marginTop: 2,
+  },
+  checkboxRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 2,
   },
   noteInput: {
     borderWidth: 1,
@@ -135,16 +164,6 @@ const baseStyles = StyleSheet.create({
     borderRadius: 8,
     alignItems: "center",
     justifyContent: "center",
-  },
-  trustBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 5,
-    paddingVertical: 9,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    borderWidth: 1,
   },
   approveBtnText: {
     fontSize: 13,
@@ -181,9 +200,21 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
   const curateFeed = useRpc(curateFeedRpc);
 
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
   const [calibrateOpen, setCalibrateOpen] = useState(false);
   const [ruleNote, setRuleNote] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  const timeLabels = useMemo(
+    () => ({
+      justNow: t("timeJustNow"),
+      minsAgo: (count: number) => t("timeMinsAgo", { count }),
+      todayAt: (time: string) => t("timeTodayAt", { time }),
+      yesterdayAt: (time: string) => t("timeYesterdayAt", { time }),
+    }),
+    [t],
+  );
 
   const accentColor =
     data.level === "error"
@@ -210,41 +241,42 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
     [busyId, data.feedId, runAction, toast],
   );
 
-  const handleSnooze = useCallback(async () => {
-    if (busyId) return;
-    setBusyId("snooze");
-    try {
-      const res = await runAction({
-        feedId: data.feedId,
-        customKind: "snooze",
-        delayMinutes: 120,
-      });
-      toast.show(res.message, { variant: "info" });
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusyId(null);
-    }
-  }, [busyId, data.feedId, runAction, toast]);
+  const handleSnooze = useCallback(
+    async (delayMinutes: number) => {
+      if (busyId) return;
+      setBusyId("snooze");
+      try {
+        const res = await runAction({
+          feedId: data.feedId,
+          customKind: "snooze",
+          delayMinutes,
+        });
+        setSnoozeOpen(false);
+        setMoreOpen(false);
+        toast.show(res.message, { variant: "info" });
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [busyId, data.feedId, runAction, toast],
+  );
 
-  const handleFeedbackUp = useCallback(async () => {
-    if (busyId) return;
-    setBusyId("up");
-    try {
-      await curateFeed({ feedId: data.feedId, feedback: "up" });
-      setCalibrateOpen(false);
-      toast.show(t("tasteUpSaved"), { variant: "success" });
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusyId(null);
-    }
-  }, [busyId, curateFeed, data.feedId, t, toast]);
+  const handleCopy = useCallback(() => {
+    void copyText(data.details || data.summary)
+      .then(() => {
+        setMoreOpen(false);
+        toast.show(t("copiedToast"), { variant: "success" });
+      })
+      .catch(() => toast.error("Copy failed"));
+  }, [data.details, data.summary, t, toast]);
 
   const handleSubmitDown = useCallback(
     async (presetNote?: string) => {
       if (busyId) return;
       setBusyId("down");
+      optimisticCurateFeed(data.feedId, "down");
       try {
         const finalNote = (presetNote ?? ruleNote).trim() || undefined;
         await curateFeed({
@@ -253,6 +285,7 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
           ruleNote: finalNote,
         });
         setCalibrateOpen(false);
+        setMoreOpen(false);
         setRuleNote("");
         toast.show(t("tasteDownSaved"), { variant: "info" });
       } catch (err) {
@@ -285,11 +318,35 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
             {data.title}
           </Text>
         </View>
-        {data.triggerName ? (
+        <View style={baseStyles.chipRow}>
           <Text style={[baseStyles.mutedSmall, { color: theme.colors.foregroundMuted }]}>
-            {data.triggerName}
+            {data.triggerName ? `${data.triggerName} · ` : ""}
+            {formatSmartTime(data.createdAt, timeLabels)}
           </Text>
-        ) : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={t("moreActions")}
+            onPress={() => {
+              setMoreOpen((v) => {
+                const next = !v;
+                if (!next) {
+                  setSnoozeOpen(false);
+                  setCalibrateOpen(false);
+                }
+                return next;
+              });
+            }}
+            style={[
+              baseStyles.moreIconBtn,
+              {
+                borderColor: moreOpen ? theme.colors.accent : theme.colors.border,
+                backgroundColor: theme.colors.surface2,
+              },
+            ]}
+          >
+            <Icon name="MoreHorizontal" size={13} color={theme.colors.foregroundMuted} />
+          </Pressable>
+        </View>
       </View>
 
       {data.details && data.details.startsWith(data.summary.slice(0, 48)) ? (
@@ -347,129 +404,154 @@ const BotAlertTimelineCardInner = memo(function BotAlertTimelineCardInner({
         </>
       )}
 
-      <View style={baseStyles.chipRow}>
-        {actions.map((act) => {
-          const done = Boolean(act.executedAt);
-          return (
+      {actions.length > 0 ? (
+        <View style={baseStyles.chipRow}>
+          {actions.map((act) => {
+            const done = Boolean(act.executedAt);
+            return (
+              <Pressable
+                key={act.id}
+                accessibilityRole="button"
+                disabled={done || busyId !== null}
+                onPress={() => void handleAction(act)}
+                style={[
+                  baseStyles.microBtn,
+                  {
+                    borderColor: done ? theme.colors.border : theme.colors.accent,
+                    backgroundColor: done ? theme.colors.surface2 : theme.colors.surface1,
+                    opacity: busyId === act.id ? 0.6 : 1,
+                  },
+                ]}
+              >
+                <Icon
+                  name={done ? "Check" : "Zap"}
+                  size={12}
+                  color={done ? theme.colors.statusSuccess : theme.colors.accent}
+                />
+                <Text
+                  style={[
+                    baseStyles.microBtnText,
+                    { color: done ? theme.colors.foregroundMuted : theme.colors.foreground },
+                  ]}
+                >
+                  {done ? t("doneActionPrefix", { label: act.label }) : act.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : null}
+
+      {moreOpen ? (
+        <View style={baseStyles.chipRow}>
+          <Pressable
+            accessibilityRole="button"
+            disabled={busyId !== null}
+            onPress={() => {
+              setSnoozeOpen((v) => !v);
+              setCalibrateOpen(false);
+            }}
+            style={[
+              baseStyles.microBtn,
+              {
+                borderColor: snoozeOpen ? theme.colors.accent : theme.colors.border,
+                backgroundColor: theme.colors.surface2,
+              },
+            ]}
+          >
+            <Icon name="Clock" size={12} color={theme.colors.foregroundMuted} />
+            <Text style={{ fontSize: 11, color: theme.colors.foreground }}>
+              {t("snoozeMenuBtn")}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            accessibilityRole="button"
+            disabled={busyId !== null}
+            onPress={() => {
+              setCalibrateOpen((v) => !v);
+              setSnoozeOpen(false);
+            }}
+            style={[
+              baseStyles.microBtn,
+              {
+                borderColor:
+                  calibrateOpen || data.feedback === "down"
+                    ? theme.colors.statusWarning
+                    : theme.colors.border,
+                backgroundColor: theme.colors.surface2,
+              },
+            ]}
+          >
+            <Icon
+              name="BellOff"
+              size={12}
+              color={
+                data.feedback === "down"
+                  ? theme.colors.statusWarning
+                  : theme.colors.foregroundMuted
+              }
+            />
+            <Text
+              style={{
+                fontSize: 11,
+                color:
+                  data.feedback === "down"
+                    ? theme.colors.statusWarning
+                    : theme.colors.foreground,
+              }}
+            >
+              {t("tasteDown")}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            accessibilityRole="button"
+            onPress={handleCopy}
+            style={[
+              baseStyles.microBtn,
+              {
+                borderColor: theme.colors.border,
+                backgroundColor: theme.colors.surface2,
+              },
+            ]}
+          >
+            <Icon name="Copy" size={11} color={theme.colors.foregroundMuted} />
+            <Text style={{ fontSize: 11, color: theme.colors.foreground }}>
+              {t("copyCard")}
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {snoozeOpen ? (
+        <View style={baseStyles.chipRow}>
+          {[
+            { label: t("snooze1h"), mins: 60 },
+            { label: t("snooze3h"), mins: 180 },
+            { label: t("snoozeTomorrowMorning"), mins: minutesUntilTomorrowMorning(9, 0) },
+          ].map((opt) => (
             <Pressable
-              key={act.id}
+              key={opt.label}
               accessibilityRole="button"
-              disabled={done || busyId !== null}
-              onPress={() => void handleAction(act)}
+              disabled={busyId !== null}
+              onPress={() => void handleSnooze(opt.mins)}
               style={[
                 baseStyles.microBtn,
                 {
-                  borderColor: done ? theme.colors.border : theme.colors.accent,
-                  backgroundColor: done ? theme.colors.surface2 : theme.colors.surface1,
-                  opacity: busyId === act.id ? 0.6 : 1,
+                  borderColor: theme.colors.accent,
+                  backgroundColor: theme.colors.surface2,
                 },
               ]}
             >
-              <Icon
-                name={done ? "Check" : "Zap"}
-                size={12}
-                color={done ? theme.colors.statusSuccess : theme.colors.accent}
-              />
-              <Text
-                style={[
-                  baseStyles.microBtnText,
-                  { color: done ? theme.colors.foregroundMuted : theme.colors.foreground },
-                ]}
-              >
-                {done ? t("doneActionPrefix", { label: act.label }) : act.label}
+              <Icon name="Clock" size={11} color={theme.colors.accent} />
+              <Text style={{ fontSize: 11, fontWeight: "600", color: theme.colors.foreground }}>
+                {opt.label}
               </Text>
             </Pressable>
-          );
-        })}
-
-        <Pressable
-          accessibilityRole="button"
-          disabled={busyId !== null}
-          onPress={() => void handleSnooze()}
-          style={[
-            baseStyles.microBtn,
-            {
-              borderColor: theme.colors.border,
-              backgroundColor: theme.colors.surface2,
-            },
-          ]}
-        >
-          <Icon name="Clock" size={12} color={theme.colors.foregroundMuted} />
-          <Text style={{ fontSize: 11, color: theme.colors.foregroundMuted }}>
-            {t("snooze2h")}
-          </Text>
-        </Pressable>
-
-        <Pressable
-          accessibilityRole="button"
-          disabled={busyId !== null}
-          onPress={() => void handleFeedbackUp()}
-          style={[
-            baseStyles.microBtn,
-            {
-              borderColor:
-                data.feedback === "up" ? theme.colors.statusSuccess : theme.colors.border,
-              backgroundColor: theme.colors.surface2,
-            },
-          ]}
-        >
-          <Icon
-            name="ThumbsUp"
-            size={12}
-            color={
-              data.feedback === "up"
-                ? theme.colors.statusSuccess
-                : theme.colors.foregroundMuted
-            }
-          />
-          <Text
-            style={{
-              fontSize: 11,
-              color:
-                data.feedback === "up"
-                  ? theme.colors.statusSuccess
-                  : theme.colors.foregroundMuted,
-            }}
-          >
-            {t("tasteUp")}
-          </Text>
-        </Pressable>
-
-        <Pressable
-          accessibilityRole="button"
-          disabled={busyId !== null}
-          onPress={() => setCalibrateOpen((v) => !v)}
-          style={[
-            baseStyles.microBtn,
-            {
-              borderColor:
-                data.feedback === "down" ? theme.colors.statusWarning : theme.colors.border,
-              backgroundColor: theme.colors.surface2,
-            },
-          ]}
-        >
-          <Icon
-            name="BellOff"
-            size={12}
-            color={
-              data.feedback === "down"
-                ? theme.colors.statusWarning
-                : theme.colors.foregroundMuted
-            }
-          />
-          <Text
-            style={{
-              fontSize: 11,
-              color:
-                data.feedback === "down"
-                  ? theme.colors.statusWarning
-                  : theme.colors.foregroundMuted,
-            }}
-          >
-            {t("tasteDown")}
-          </Text>
-        </Pressable>
-      </View>
+          ))}
+        </View>
+      ) : null}
 
       {calibrateOpen ? (
         <View
@@ -578,18 +660,23 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
   const [previewOpen, setPreviewOpen] = useState(Boolean(data.payloadPreview));
   const [editingDraft, setEditingDraft] = useState(false);
   const [draftText, setDraftText] = useState(initialPreview);
+  const [trustChecked, setTrustChecked] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
 
   const isPending = data.status === "pending";
-  const isEdited = editingDraft && draftText.trim() !== initialPreview.trim();
+  const isHighRisk = data.riskLevel === "high";
+  const isEdited = draftText.trim() !== initialPreview.trim();
 
   const borderTone =
     data.status === "approved"
       ? theme.colors.statusSuccess
       : data.status === "rejected"
         ? theme.colors.foregroundMuted
-        : theme.colors.statusWarning;
+        : isHighRisk
+          ? theme.colors.statusDanger
+          : theme.colors.statusWarning;
 
   const badgeLabel =
     data.status === "pending"
@@ -601,9 +688,10 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
         : t("statusRejected");
 
   const onDecide = useCallback(
-    async (decision: "approved" | "rejected", promoteTrust = false) => {
+    async (decision: "approved" | "rejected") => {
       if (busy) return;
       setBusy(true);
+      optimisticResolveApproval(data.approvalId, decision);
       try {
         const res = await resolveApproval({
           id: data.approvalId,
@@ -611,7 +699,8 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
           note: note.trim() || undefined,
           editedFollowUpPrompt:
             decision === "approved" && isEdited ? draftText.trim() : undefined,
-          promoteTrust: decision === "approved" && promoteTrust ? true : undefined,
+          promoteTrust:
+            decision === "approved" && !isHighRisk && trustChecked ? true : undefined,
         });
         toast.show(
           decision === "approved"
@@ -627,7 +716,18 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
         setBusy(false);
       }
     },
-    [busy, data.approvalId, draftText, isEdited, note, resolveApproval, t, toast],
+    [
+      busy,
+      data.approvalId,
+      draftText,
+      isEdited,
+      isHighRisk,
+      note,
+      resolveApproval,
+      t,
+      toast,
+      trustChecked,
+    ],
   );
 
   return (
@@ -747,25 +847,65 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
 
       {isPending ? (
         <View style={baseStyles.actionsBlock}>
-          <TextInput
-            value={note}
-            onChangeText={setNote}
-            placeholder={t("approvalNotePlaceholder")}
-            placeholderTextColor={theme.colors.foregroundMuted}
-            style={[
-              baseStyles.noteInput,
-              {
-                borderColor: theme.colors.border,
-                color: theme.colors.foreground,
-                backgroundColor: theme.colors.surface2,
-              },
-            ]}
-          />
+          <View style={baseStyles.actionFooterRow}>
+            {data.triggerId && !isHighRisk ? (
+              <Pressable
+                accessibilityRole="checkbox"
+                accessibilityState={{ checked: trustChecked }}
+                onPress={() => setTrustChecked((v) => !v)}
+                style={baseStyles.checkboxRow}
+              >
+                <Icon
+                  name={trustChecked ? "CheckSquare" : "Square"}
+                  size={14}
+                  color={trustChecked ? theme.colors.accent : theme.colors.foregroundMuted}
+                />
+                <Text style={{ fontSize: 12, color: theme.colors.foreground }}>
+                  {t("trustCheckboxLabel")}
+                </Text>
+              </Pressable>
+            ) : (
+              <View />
+            )}
+
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setNoteOpen((v) => !v)}
+              style={baseStyles.checkboxRow}
+            >
+              <Icon
+                name={noteOpen ? "ChevronUp" : "Plus"}
+                size={12}
+                color={theme.colors.foregroundMuted}
+              />
+              <Text style={[baseStyles.mutedSmall, { color: theme.colors.foregroundMuted }]}>
+                {noteOpen ? t("hideApprovalNoteBtn") : t("addApprovalNoteBtn")}
+              </Text>
+            </Pressable>
+          </View>
+
+          {noteOpen ? (
+            <TextInput
+              value={note}
+              onChangeText={setNote}
+              placeholder={t("approvalNotePlaceholder")}
+              placeholderTextColor={theme.colors.foregroundMuted}
+              style={[
+                baseStyles.noteInput,
+                {
+                  borderColor: theme.colors.border,
+                  color: theme.colors.foreground,
+                  backgroundColor: theme.colors.surface2,
+                },
+              ]}
+            />
+          ) : null}
+
           <View style={baseStyles.buttonRow}>
             <Pressable
               accessibilityRole="button"
               disabled={busy}
-              onPress={() => void onDecide("approved", false)}
+              onPress={() => void onDecide("approved")}
               style={[
                 baseStyles.approveBtn,
                 {
@@ -784,31 +924,10 @@ const BotApprovalTimelineCardInner = memo(function BotApprovalTimelineCardInner(
               </Text>
             </Pressable>
 
-            {data.triggerId ? (
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy}
-                onPress={() => void onDecide("approved", true)}
-                style={[
-                  baseStyles.trustBtn,
-                  {
-                    borderColor: theme.colors.accent,
-                    backgroundColor: theme.colors.surface2,
-                    opacity: busy ? 0.6 : 1,
-                  },
-                ]}
-              >
-                <Icon name="Zap" size={13} color={theme.colors.accent} />
-                <Text style={{ fontSize: 12, fontWeight: "600", color: theme.colors.accent }}>
-                  {t("approveAndTrust")}
-                </Text>
-              </Pressable>
-            ) : null}
-
             <Pressable
               accessibilityRole="button"
               disabled={busy}
-              onPress={() => void onDecide("rejected", false)}
+              onPress={() => void onDecide("rejected")}
               style={[
                 baseStyles.rejectBtn,
                 {

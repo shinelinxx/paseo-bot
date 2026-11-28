@@ -135,6 +135,7 @@ export class BotStateStore {
     resolved: string;
     mtimeMs: number;
     size: number;
+    checkedAtMs: number;
     content: string;
   } | null = null;
 
@@ -193,9 +194,22 @@ export class BotStateStore {
     if (this.state.dismissedSuggestionIds.length > 100) {
       this.state.dismissedSuggestionIds = this.state.dismissedSuggestionIds.slice(-100);
     }
-    const cutoff = Date.now() - 3600_000;
+    const now = Date.now();
+    const cutoff = now - 3600_000;
     if (this.state.wakeTimestamps.length > 0 && this.state.wakeTimestamps[0] <= cutoff) {
       this.state.wakeTimestamps = this.state.wakeTimestamps.filter((ts) => ts > cutoff);
+    }
+    // Auto-prune completed one-shot self_wake triggers older than 24h (keep up to 10 recent)
+    if (this.state.triggers.length > 12) {
+      const reminderCutoff = now - 24 * 3600_000;
+      let finishedSelfWakeKept = 0;
+      this.state.triggers = this.state.triggers.filter((t) => {
+        if (t.kind !== "self_wake" || t.enabled || t.runCount < 1) return true;
+        const ts = Date.parse(t.lastTriggeredAt || t.updatedAt);
+        if (Number.isFinite(ts) && ts < reminderCutoff) return false;
+        finishedSelfWakeKept += 1;
+        return finishedSelfWakeKept <= 10;
+      });
     }
   }
 
@@ -317,6 +331,14 @@ export class BotStateStore {
 
   async readMemory(memoryFilePath: string): Promise<string> {
     const resolved = path.resolve(expandHomePath(memoryFilePath));
+    const now = Date.now();
+    if (
+      this.memoryCache &&
+      this.memoryCache.resolved === resolved &&
+      now - this.memoryCache.checkedAtMs < 2_000
+    ) {
+      return this.memoryCache.content;
+    }
     try {
       const st = await fs.stat(resolved);
       if (
@@ -325,6 +347,7 @@ export class BotStateStore {
         this.memoryCache.mtimeMs === st.mtimeMs &&
         this.memoryCache.size === st.size
       ) {
+        this.memoryCache.checkedAtMs = now;
         return this.memoryCache.content;
       }
       const content = await fs.readFile(resolved, "utf8");
@@ -332,6 +355,7 @@ export class BotStateStore {
         resolved,
         mtimeMs: st.mtimeMs,
         size: st.size,
+        checkedAtMs: now,
         content,
       };
       return content;
@@ -354,6 +378,7 @@ export class BotStateStore {
         resolved,
         mtimeMs: st.mtimeMs,
         size: st.size,
+        checkedAtMs: Date.now(),
         content,
       };
     } catch {

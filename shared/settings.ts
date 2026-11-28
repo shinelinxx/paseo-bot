@@ -20,6 +20,11 @@ export const BotSettingsSchema = z.object({
   desktopNotify: z.boolean().default(true),
   hourlyWakeLimit: z.number().int().min(1).max(200).default(24),
   injectToolsGlobally: z.boolean().default(true),
+  autoRenameOnFirstTurn: z.boolean().default(true),
+  duplicateSessionHintOnCreate: z.boolean().default(true),
+  tidyIdleArchiveHours: z.number().int().min(1).max(720).default(24),
+  tidyWriteObsidianDigest: z.boolean().default(true),
+  hidePinnedEmptyProjects: z.boolean().default(true),
 });
 
 export type BotSettings = z.output<typeof BotSettingsSchema>;

@@ -4,12 +4,17 @@ import {
 } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { memo, useCallback, useMemo } from "react";
-import { StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { SCREEN_ID } from "../shared/contracts";
 import { messages } from "./i18n";
 import { setRequestedConsoleTab, useBotSidebarCounts } from "./store";
 
 const styles = StyleSheet.create({
+  trailingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
   badge: {
     paddingHorizontal: 7,
     paddingVertical: 2,
@@ -36,6 +41,13 @@ const PaseoBotSidebarItemInner = memo(function PaseoBotSidebarItemInner({
   const hasUnread = counts.unreadCount > 0;
   const hasRunning = counts.runningWorkerCount > 0;
 
+  const handlePress = useCallback(() => {
+    if (hasApprovals) {
+      setRequestedConsoleTab("inbox");
+    }
+    openScreen({ screenId: SCREEN_ID });
+  }, [hasApprovals, openScreen]);
+
   const trailing = useMemo(() => {
     let badgeBg: string | null = null;
     let badgeFg: string = theme.colors.foreground;
@@ -56,14 +68,19 @@ const PaseoBotSidebarItemInner = memo(function PaseoBotSidebarItemInner({
     }
 
     if (!badgeText) return undefined;
+
     return (
-      <View
-        style={[
-          styles.badge,
-          { backgroundColor: badgeBg ?? theme.colors.surface2 },
-        ]}
-      >
-        <Text style={[styles.badgeText, { color: badgeFg }]}>{badgeText}</Text>
+      <View style={styles.trailingRow}>
+        <Pressable
+          accessibilityRole="button"
+          onPress={handlePress}
+          style={[
+            styles.badge,
+            { backgroundColor: badgeBg ?? theme.colors.surface2 },
+          ]}
+        >
+          <Text style={[styles.badgeText, { color: badgeFg }]}>{badgeText}</Text>
+        </Pressable>
       </View>
     );
   }, [
@@ -73,6 +90,7 @@ const PaseoBotSidebarItemInner = memo(function PaseoBotSidebarItemInner({
     counts.pendingApprovalCount,
     counts.unreadCount,
     counts.runningWorkerCount,
+    handlePress,
     theme.colors.foreground,
     theme.colors.statusWarning,
     theme.colors.surface0,
@@ -81,13 +99,6 @@ const PaseoBotSidebarItemInner = memo(function PaseoBotSidebarItemInner({
     theme.colors.surface2,
     theme.colors.foregroundMuted,
   ]);
-
-  const handlePress = useCallback(() => {
-    if (hasApprovals) {
-      setRequestedConsoleTab("approvals");
-    }
-    openScreen({ screenId: SCREEN_ID });
-  }, [hasApprovals, openScreen]);
 
   return (
     <SidebarRow

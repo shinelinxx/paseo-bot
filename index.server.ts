@@ -8,6 +8,7 @@ import {
   executeFeedActionRpc,
   getBotSnapshotRpc,
   installPresetRpc,
+  listModelsRpc,
   manageNativeScheduleRpc,
   manageWorkerRpc,
   markFeedReadRpc,
@@ -16,9 +17,12 @@ import {
   saveMemoryRpc,
   setGlobalPauseRpc,
   submitWishRpc,
+  tidySessionsRpc,
   toggleTriggerRpc,
+  upsertNativeScheduleRpc,
   upsertTriggerRpc,
   watchBotStateSubscription,
+  watchBotSummarySubscription,
 } from "./shared/contracts";
 import { paseoBotSettings } from "./shared/settings";
 import { ProactiveEngine } from "./server/engine";
@@ -34,6 +38,23 @@ export default function contribute(server: PluginServerContext) {
     engine.attachPaseo(paseo);
     await ready;
     return engine.getSnapshot();
+  });
+
+  server.handle(watchBotSummarySubscription, (_input, { paseo, push, signal }) => {
+    if (signal.aborted) return;
+    engine.attachPaseo(paseo);
+    void ready
+      .then(async () => {
+        if (signal.aborted) return;
+        await push(await engine.getSummary());
+      })
+      .catch(() => undefined);
+
+    const unsub = engine.subscribeSummary((summary) => {
+      if (signal.aborted) return;
+      void push(summary).catch(() => undefined);
+    });
+    signal.addEventListener("abort", () => unsub(), { once: true });
   });
 
   server.handle(watchBotStateSubscription, (_input, { paseo, push, signal }) => {
@@ -53,10 +74,16 @@ export default function contribute(server: PluginServerContext) {
     signal.addEventListener("abort", () => unsub(), { once: true });
   });
 
-  server.handle(ensureChiefBotRpc, async ({ reset }, { paseo }) => {
+  server.handle(listModelsRpc, async ({ refresh }, { paseo }) => {
     engine.attachPaseo(paseo);
     await ready;
-    return engine.ensureChiefBot({ reset });
+    return engine.listAvailableModels(Boolean(refresh));
+  });
+
+  server.handle(ensureChiefBotRpc, async ({ reset, provider }, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.ensureChiefBot({ reset, provider });
   });
 
   server.handle(submitWishRpc, async (input, { paseo }) => {
@@ -68,7 +95,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(draftMissionRpc, async ({ intent, cwd }, { paseo }) => {
     engine.attachPaseo(paseo);
     await ready;
-    return { draft: engine.draftMission(intent, cwd) };
+    return { draft: await engine.draftMission(intent, cwd) };
   });
 
   server.handle(upsertTriggerRpc, async (input, { paseo }) => {
@@ -84,11 +111,16 @@ export default function contribute(server: PluginServerContext) {
     return { ok };
   });
 
-  server.handle(deleteTriggerRpc, async ({ id }, { paseo }) => {
+  server.handle(deleteTriggerRpc, async ({ id, clearFinishedReminders }, { paseo }) => {
     engine.attachPaseo(paseo);
     await ready;
+    if (clearFinishedReminders) {
+      const removedCount = await engine.clearFinishedReminders();
+      return { ok: true, removedCount };
+    }
+    if (!id) return { ok: false, removedCount: 0 };
     const ok = await engine.deleteTrigger(id);
-    return { ok };
+    return { ok, removedCount: ok ? 1 : 0 };
   });
 
   server.handle(runTriggerNowRpc, async ({ id }, { paseo }) => {
@@ -137,28 +169,54 @@ export default function contribute(server: PluginServerContext) {
     return engine.manageWorker(input);
   });
 
+  server.handle(upsertNativeScheduleRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.upsertNativeSchedule(input);
+  });
+
   server.handle(manageNativeScheduleRpc, async (input, { paseo }) => {
     engine.attachPaseo(paseo);
     await ready;
     return engine.manageNativeSchedule(input);
   });
 
-  server.handle(markFeedReadRpc, async ({ id, clearSilent }, { paseo }) => {
-    engine.attachPaseo(paseo);
-    await ready;
-    await engine.store.mutate((draft) => {
-      if (clearSilent) {
-        draft.feed = draft.feed.filter((f) => f.level !== "silent");
-      }
-      for (const f of draft.feed) {
-        if (!id || f.id === id) {
-          f.unread = false;
+  server.handle(
+    markFeedReadRpc,
+    async ({ id, clearSilent, dismissId, clearRead }, { paseo }) => {
+      engine.attachPaseo(paseo);
+      await ready;
+      let removedCount = 0;
+      await engine.store.mutate((draft) => {
+        if (dismissId) {
+          const before = draft.feed.length;
+          draft.feed = draft.feed.filter((f) => f.id !== dismissId);
+          removedCount += before - draft.feed.length;
+          return;
         }
-      }
-    });
-    await engine.broadcastSnapshot();
-    return { ok: true };
-  });
+        if (clearSilent) {
+          const before = draft.feed.length;
+          draft.feed = draft.feed.filter((f) => f.level !== "silent");
+          removedCount += before - draft.feed.length;
+        }
+        if (clearRead) {
+          const before = draft.feed.length;
+          draft.feed = draft.feed.filter(
+            (f) => f.unread || f.inProgress || f.level === "approval_required",
+          );
+          removedCount += before - draft.feed.length;
+          return;
+        }
+        for (const f of draft.feed) {
+          if (!id || f.id === id) {
+            f.unread = false;
+          }
+        }
+      });
+      await engine.broadcastSnapshot();
+      return { ok: true, removedCount };
+    },
+  );
 
   server.handle(saveMemoryRpc, async ({ content }, { paseo }) => {
     engine.attachPaseo(paseo);
@@ -174,6 +232,12 @@ export default function contribute(server: PluginServerContext) {
     await ready;
     const next = await engine.setGlobalPaused(paused);
     return { paused: next };
+  });
+
+  server.handle(tidySessionsRpc, async (input, { paseo }) => {
+    engine.attachPaseo(paseo);
+    await ready;
+    return engine.tidySessions(input);
   });
 
   return async () => {

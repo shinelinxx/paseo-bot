@@ -182,38 +182,76 @@ const GENERIC_WORKSPACE_KEYWORDS = new Set([
   "源码",
   "插件",
   "自动化",
+  "公司",
+  "工作室",
+  "专项",
+  "架构",
+  "成立",
+  "迁移",
+  "服务",
   "workspace",
   "project",
   "general",
   "default",
   "documents",
   "users",
+  "company",
+  "agent",
 ]);
 
 function extractWorkspaceKeywordsFromLabel(label: string): string[] {
   const clean = label
-    .replace(/[*`'"「」《》()（）]/g, " ")
+    .replace(/\[\d{4}-\d{2}-\d{2}\]/g, " ")
+    .replace(/[*`'"]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   if (!clean) return [];
   const results = new Set<string>();
+  const addCjkVariants = (rawSeg: string) => {
+    const trimmed = rawSeg.trim();
+    if (!trimmed) return;
+    const stripped = trimmed
+      .replace(/\s*(?:自主意识)?\s*(?:ai\s*)?(?:软件)?(?:公司|工作室)(?:成立.*)?$/iu, "")
+      .replace(/(?:成立与.*|服务迁移.*)$/u, "")
+      .trim();
+    for (const form of [trimmed, stripped]) {
+      const lowerForm = form.toLowerCase();
+      if (!form || GENERIC_WORKSPACE_KEYWORDS.has(lowerForm)) continue;
+      const hasCjk = /[\u4e00-\u9fa5]/.test(form);
+      if ((hasCjk && form.length >= 2) || (!hasCjk && form.length >= 3)) {
+        results.add(lowerForm);
+      }
+      // Extract concise CJK core aliases like "美亚撸货" from "美亚自动化撸货", "卡旅" from "卡旅私享管家"
+      if (hasCjk && form.includes("私享管家")) {
+        const prefix = form.split("私享管家")[0]?.trim();
+        if (prefix && prefix.length >= 2 && !GENERIC_WORKSPACE_KEYWORDS.has(prefix)) {
+          results.add(prefix.toLowerCase());
+        }
+      }
+      if (hasCjk && form.includes("自动化") && form.length >= 4) {
+        const compact = form.replace("自动化", "").trim();
+        if (compact.length >= 2 && !GENERIC_WORKSPACE_KEYWORDS.has(compact)) {
+          results.add(compact.toLowerCase());
+        }
+      }
+    }
+  };
+
   const segments = clean
-    .split(/[/／、，,|｜·：:;；]+/)
+    .split(/[/／、，,|｜·：:;；()（）「」《》[\]]+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
   for (const seg of segments) {
-    const lowerSeg = seg.toLowerCase();
-    if (!GENERIC_WORKSPACE_KEYWORDS.has(lowerSeg)) {
-      const hasCjk = /[\u4e00-\u9fa5]/.test(seg);
-      if ((hasCjk && seg.length >= 2) || (!hasCjk && seg.length >= 3)) {
-        results.add(lowerSeg);
-      }
-    }
+    addCjkVariants(seg);
     const asciiMatches = seg.match(/[A-Za-z][A-Za-z0-9_-]{2,32}/g) ?? [];
     for (const token of asciiMatches) {
       const lowerTok = token.toLowerCase();
-      if (!GENERIC_WORKSPACE_KEYWORDS.has(lowerTok) && lowerTok !== "paseo") {
+      if (
+        !GENERIC_WORKSPACE_KEYWORDS.has(lowerTok) &&
+        lowerTok !== "paseo" &&
+        lowerTok !== "agent-company"
+      ) {
         results.add(lowerTok);
       }
     }
@@ -225,26 +263,71 @@ export function extractMemoryWorkspaceHints(
   memoryContent: string,
 ): Array<{ cwd: string; label: string; keywords: string[] }> {
   if (!memoryContent.trim()) return [];
-  const results: Array<{ cwd: string; label: string; keywords: string[] }> = [];
-  const seen = new Set<string>();
+  const merged = new Map<string, { cwd: string; label: string; keywords: Set<string> }>();
+
+  const upsertHint = (rawLabel: string, rawPath: string) => {
+    const cleanPath = rawPath.trim().replace(/[.,;:]+$/, "");
+    if (!cleanPath) return;
+    const resolved = path.resolve(expandHomePath(cleanPath));
+    const cleanLabel = rawLabel
+      .replace(/^(?:-\s*)?(?:\[\d{4}-\d{2}-\d{2}\]\s*-?\s*)+/g, "")
+      .replace(/\*+/g, "")
+      .trim();
+    if (!cleanLabel) return;
+    const kws = extractWorkspaceKeywordsFromLabel(cleanLabel);
+    const existing = merged.get(resolved);
+    if (existing) {
+      for (const kw of kws) existing.keywords.add(kw);
+      return;
+    }
+    merged.set(resolved, {
+      cwd: resolved,
+      label: cleanLabel,
+      keywords: new Set(kws),
+    });
+  };
+
+  // 1. Direct map lines: `- **Label**：~/path` or `- Label: /Users/...`
   const lineRe =
-    /^\s*[-*]\s+\*{0,2}([^：:\n`]{2,48}?)\*{0,2}\s*[：:]\s*`?((?:~\/|\/Users\/|\/home\/|\/opt\/)[^`\s（()）,，。；;]+)`?/gm;
+    /^\s*[-*]\s+\*{0,2}([^：:\n`]{2,64}?)\*{0,2}\s*[：:]\s*`?((?:~\/|\/Users\/|\/home\/|\/opt\/)[^`\s（()）,，。；;]+)`?/gm;
   let match: RegExpExecArray | null;
   while ((match = lineRe.exec(memoryContent)) !== null) {
-    const rawLabel = match[1].trim();
-    const rawPath = match[2].trim().replace(/[.,;:]+$/, "");
-    if (!rawPath) continue;
-    const resolved = path.resolve(expandHomePath(rawPath));
-    if (seen.has(resolved)) continue;
-    seen.add(resolved);
-    results.push({
-      cwd: resolved,
-      label: rawLabel,
-      keywords: extractWorkspaceKeywordsFromLabel(rawLabel),
-    });
+    upsertHint(match[1], match[2]);
   }
-  return results;
+
+  // 2. Active Goals / AI Company bullets mentioning a project/company heading and its workspace path
+  const bulletLines = memoryContent.split(/\r?\n/);
+  for (const line of bulletLines) {
+    if (!/^\s*[-*]\s+/.test(line)) continue;
+    const headingMatch =
+      /^\s*[-*]\s+(?:\[\d{4}-\d{2}-\d{2}\]\s*-?\s*)*\*\*([^*]{2,80})\*\*\s*[：:]/.exec(line);
+    if (!headingMatch) continue;
+    const heading = headingMatch[1].trim();
+    const anchoredMatch =
+      /(?:在|本地路径|工作区|目录)\s*[：:]?\s*`((?:~\/|\/Users\/|\/home\/|\/opt\/)[^`\s（()）,，。；;]+)`/.exec(
+        line,
+      );
+    if (anchoredMatch) {
+      upsertHint(heading, anchoredMatch[1]);
+      continue;
+    }
+    const pathMatches = [
+      ...line.matchAll(/`((?:~\/|\/Users\/|\/home\/|\/opt\/)[^`\s（()）,，。；;]+)`/g),
+    ];
+    if (pathMatches.length === 1) {
+      upsertHint(heading, pathMatches[0][1]);
+    }
+  }
+
+  return [...merged.values()].map((item) => ({
+    cwd: item.cwd,
+    label: item.label,
+    keywords: [...item.keywords],
+  }));
 }
+
+const PASEO_BOT_REPO_INTENT_RE =
+  /(?:插件|源码|代码|仓库|逻辑|修复|bug|重构|前端|后端|气泡|抽屉|模型切换|单测|测试|typecheck|engine\.ts|router\.ts|intent\.ts|tools\.ts|总舵|总控|派给|交给)/iu;
 
 export function inferWorkspaceAndWatchPath(
   intent: string,
@@ -260,6 +343,14 @@ export function inferWorkspaceAndWatchPath(
   if (pathMatch) {
     const resolved = expandHomePath(pathMatch[1]);
     return { cwd: resolved, watchPath: resolved };
+  }
+
+  const homeDocs = path.join(os.homedir(), "Documents");
+  if (
+    /\bpaseo[-_]bot\b/i.test(intent) ||
+    (/\bpaseo\s+bot\b/i.test(intent) && PASEO_BOT_REPO_INTENT_RE.test(intent))
+  ) {
+    return { cwd: path.join(homeDocs, "paseo", "paseo-bot") };
   }
 
   // Merge known workspaces and MEMORY.md workspace map hints into unified candidates
@@ -286,7 +377,9 @@ export function inferWorkspaceAndWatchPath(
     addCandidate(hint.cwd, hint.label, hint.keywords);
   }
 
-  const lowerIntent = intent.toLowerCase();
+  const lowerIntent = intent
+    .toLowerCase()
+    .replace(/\bpaseo\s+bot\b/gi, " ");
   let bestCwd: string | null = null;
   let bestScore = 0;
 
@@ -342,11 +435,6 @@ export function inferWorkspaceAndWatchPath(
       return { cwd: bestCwd, watchPath: path.join(bestCwd, "00-Inbox") };
     }
     return { cwd: bestCwd };
-  }
-
-  const homeDocs = path.join(os.homedir(), "Documents");
-  if (/\bpaseo[\s_-]?bot\b/i.test(intent)) {
-    return { cwd: path.join(homeDocs, "paseo", "paseo-bot") };
   }
 
   // Match ~/Documents/<ProjectName> when an explicit CamelCase/hyphenated project name is mentioned
@@ -889,6 +977,184 @@ export interface RoutableAgentCandidate {
   projectName?: string;
   updatedAtMs: number;
   isBackground?: boolean;
+  status?: string;
+  labels?: Record<string, string>;
+  providerModel?: string;
+}
+
+export interface ParsedRosterCoordinator {
+  agentId: string;
+  roleTitle: string;
+  companyName?: string;
+}
+
+function normalizeCoordinatorCwd(raw: string): string {
+  if (!raw?.trim()) return "";
+  return path.resolve(expandHomePath(raw.trim()));
+}
+
+function cleanRosterRoleTitle(raw: string): string {
+  const stripped = raw
+    .replace(/\*+/g, "")
+    .replace(/`+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const dedupedSuffix = stripped.replace(/(总控[^（()）]*)[（(]\s*总控\s*[)）]$/u, "$1").trim();
+  return dedupedSuffix.replace(/(总舵)[（(]\s*总控\s*[)）]$/u, "$1").trim() || stripped;
+}
+
+/**
+ * Parse the canonical Company Coordinator (`总控` / `Lead`) entry from an `agent-company`
+ * `.company/roster.md` Markdown file.
+ */
+export function parseCompanyCoordinatorFromRoster(
+  rosterMarkdown: string,
+): ParsedRosterCoordinator | null {
+  if (!rosterMarkdown || !rosterMarkdown.trim()) return null;
+
+  const headerLeadMatch = />\s*由(?:总控中枢)?\s*\*\*([^*]+)\*\*\s*统管/u.exec(rosterMarkdown);
+  const headerLeadName = headerLeadMatch ? cleanRosterRoleTitle(headerLeadMatch[1]) : "";
+
+  let best: { agentId: string; roleTitle: string; score: number } | null = null;
+  const lines = rosterMarkdown.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) continue;
+    const rawCells = trimmed
+      .slice(1, -1)
+      .split("|")
+      .map((c) => c.trim());
+    if (rawCells.length < 3) continue;
+
+    // Skip separator or table header rows
+    if (rawCells.every((c) => /^[-:\s]+$/.test(c))) continue;
+    const firstClean = rawCells[0].replace(/[*`]/g, "").trim();
+    if (/^(?:岗位|部门|角色|role|department)/iu.test(firstClean)) continue;
+
+    const statusCell = rawCells[rawCells.length - 1]?.replace(/[*`]/g, "").trim() ?? "";
+    if (/^(?:已归档|archived|retired|deprecated)/iu.test(statusCell)) continue;
+
+    // Find UUID or 8..36 hex Agent ID cell
+    let matchedAgentId = "";
+    for (const cell of rawCells) {
+      const uuidMatch =
+        /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i.exec(cell);
+      if (uuidMatch) {
+        matchedAgentId = uuidMatch[1].toLowerCase();
+        break;
+      }
+    }
+    if (!matchedAgentId) {
+      for (const cell of rawCells) {
+        const cleanCell = cell.replace(/`/g, "").trim();
+        if (/^[0-9a-f]{8,36}$/i.test(cleanCell)) {
+          matchedAgentId = cleanCell.toLowerCase();
+          break;
+        }
+      }
+    }
+    if (!matchedAgentId) continue;
+
+    let score = 0;
+    const rolePlain = rawCells[0].replace(/[*`]/g, "").trim();
+    const rowPlain = rawCells.join(" ").replace(/[*`]/g, "");
+
+    if (/(?:总控|总舵|首席管家|\bcoordinator\b|\borchestrator\b|\blead\b)/iu.test(rolePlain)) {
+      score += 100;
+    }
+    if (headerLeadName && (rolePlain.includes(headerLeadName) || headerLeadName.includes(rolePlain))) {
+      score += 80;
+    }
+    if (/\.company\/roles\/(?:[a-z0-9_-]*lead|coordinator|pm)\.md\b/i.test(rowPlain)) {
+      score += 60;
+    }
+
+    if (score >= 60 && (!best || score > best.score)) {
+      best = {
+        agentId: matchedAgentId,
+        roleTitle: cleanRosterRoleTitle(rawCells[0]) || "总控",
+        score,
+      };
+    }
+  }
+
+  return best ? { agentId: best.agentId, roleTitle: best.roleTitle } : null;
+}
+
+/**
+ * Check whether a live Paseo agent candidate represents an AI Company Coordinator (`总控` / `lead`).
+ * Requires explicit lead labels OR a coordinator title within a verified company workspace
+ * (preventing false positives on generic hub titles like `📌 日常总控 · General`).
+ */
+export function isCompanyCoordinatorCandidate(
+  cand: RoutableAgentCandidate,
+  opts?: { hasCompanyDir?: boolean },
+): boolean {
+  if (cand.isBackground || cand.status === "error") return false;
+  const labels = cand.labels ?? {};
+  if (labels["paseo-bot/role"]) return false;
+
+  const role = (
+    labels.role ||
+    labels["company.role"] ||
+    labels["paseo-company/role"] ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  if (role === "lead" || role === "coordinator") {
+    return true;
+  }
+
+  const hasCompanyMeta = Boolean(
+    labels.company || labels["paseo-company/name"] || opts?.hasCompanyDir,
+  );
+  const dept = (labels.dept || labels["paseo-company/dept"] || "").trim().toLowerCase();
+  if (hasCompanyMeta && (dept === "lead" || dept.endsWith("-lead") || dept === "coordinator")) {
+    return true;
+  }
+
+  if (
+    hasCompanyMeta &&
+    /(?:总控|总舵|\bcompany\s+coordinator\b|\blead\s+orchestrator\b)/iu.test(cand.title)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export function pickBestCompanyCoordinatorCandidate(input: {
+  targetCwd: string;
+  candidates: readonly RoutableAgentCandidate[];
+  rosterCoordinator?: ParsedRosterCoordinator | null;
+  hasCompanyDir?: boolean;
+  excludeAgentId?: string;
+}): RoutableAgentCandidate | null {
+  const normTarget = normalizeCoordinatorCwd(input.targetCwd);
+  if (!normTarget) return null;
+
+  const inTargetCwd = input.candidates.filter((c) => {
+    if (c.isBackground || c.status === "error") return false;
+    if (input.excludeAgentId && c.id === input.excludeAgentId) return false;
+    if (c.labels?.["paseo-bot/role"]) return false;
+    return Boolean(c.cwd) && normalizeCoordinatorCwd(c.cwd) === normTarget;
+  });
+
+  if (input.rosterCoordinator?.agentId) {
+    const targetId = input.rosterCoordinator.agentId.toLowerCase();
+    const byRoster =
+      inTargetCwd.find((c) => c.id.toLowerCase() === targetId) ??
+      inTargetCwd.find((c) => c.id.toLowerCase().startsWith(targetId));
+    if (byRoster) return byRoster;
+  }
+
+  const leadMatches = inTargetCwd
+    .filter((c) => isCompanyCoordinatorCandidate(c, { hasCompanyDir: input.hasCompanyDir }))
+    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+
+  return leadMatches[0] ?? null;
 }
 
 export interface FollowUpRouteDecision {

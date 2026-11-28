@@ -56,6 +56,8 @@ import {
   hasDirectSessionReferenceHint,
   inferWorkspaceAndWatchPath,
   normalizeAgentImages,
+  parseCompanyCoordinatorFromRoster,
+  pickBestCompanyCoordinatorCandidate,
   resolveWishSubmissionContent,
   routeDirectWishToSession,
   routeFollowUpCandidate,
@@ -88,6 +90,7 @@ import {
   extractInlineLinksFromMarkdown,
   parseProfilePreferenceFromMemoryNote,
   resolveTierProviderChain,
+  shouldPreferDirectCoordinatorHandoff,
 } from "./router.ts";
 import {
   BotStateStore,
@@ -243,6 +246,7 @@ export class ProactiveEngine {
   private ensureL1InFlight: Promise<{
     handle: ReturnType<PaseoApi["agents"]["ref"]>;
     modelUsed: string;
+    ephemeral?: boolean;
   }> | null = null;
   private l1FallbackConfigKey: string | null = null;
   private l1FallbackModelUsed: string | null = null;
@@ -2321,17 +2325,26 @@ export class ProactiveEngine {
       const a = entry.agent as unknown as Record<string, unknown>;
       if (!a || typeof a.id !== "string" || a.archivedAt) continue;
       const isBg = Boolean(a.background);
-      const labels =
-        a.labels && typeof a.labels === "object"
+      const rawStatus = typeof a.status === "string" ? a.status : undefined;
+      if (rawStatus === "error") continue;
+      const rawLabels =
+        a.labels && typeof a.labels === "object" && !Array.isArray(a.labels)
           ? (a.labels as Record<string, unknown>)
           : undefined;
       if (
         isBg ||
-        labels?.["paseo-bot/role"] === "scout" ||
-        labels?.["paseo-bot/role"] === "butler-l1" ||
-        labels?.["paseo-bot/role"] === "butler-exec"
+        rawLabels?.["paseo-bot/role"] === "scout" ||
+        rawLabels?.["paseo-bot/role"] === "butler-l1" ||
+        rawLabels?.["paseo-bot/role"] === "butler-exec"
       ) {
         continue;
+      }
+
+      const cleanLabels: Record<string, string> = {};
+      if (rawLabels) {
+        for (const [k, v] of Object.entries(rawLabels)) {
+          if (typeof v === "string") cleanLabels[k] = v;
+        }
       }
 
       const wsId = typeof a.workspaceId === "string" ? a.workspaceId : undefined;
@@ -2347,11 +2360,224 @@ export class ProactiveEngine {
         projectName: wsMeta?.projectName,
         updatedAtMs: Number.isFinite(rawUpdated) ? rawUpdated : 0,
         isBackground: isBg,
+        status: rawStatus,
+        labels: Object.keys(cleanLabels).length > 0 ? cleanLabels : undefined,
+        providerModel: formatAgentModelPair(a),
       });
     }
     this.cachedRoutableCandidates = results;
     this.cachedRoutableAt = now;
     return results;
+  }
+
+  private upsertCoordinatorWorkerDraft(
+    draft: import("./storage.ts").PersistedBotState,
+    params: {
+      agentId: string;
+      workspaceId?: string;
+      title: string;
+      cwd: string;
+      provider: string;
+      goal: string;
+      notifyChiefOnFinish: boolean;
+      nowIso: string;
+      idPrefix?: string;
+    },
+  ): DelegatedWorker {
+    const existingIdx = draft.workers.findIndex(
+      (w) => w.agentId === params.agentId && w.status !== "archived",
+    );
+    if (existingIdx >= 0) {
+      const existing = draft.workers[existingIdx];
+      existing.workspaceId = params.workspaceId ?? existing.workspaceId;
+      existing.title = params.title || existing.title;
+      existing.cwd = params.cwd;
+      existing.provider = params.provider || existing.provider;
+      existing.status = "running";
+      existing.goal = params.goal.slice(0, 1000);
+      existing.notifyChiefOnFinish = params.notifyChiefOnFinish;
+      existing.updatedAt = params.nowIso;
+      existing.pendingCoordinatorReport = true;
+      draft.workers.splice(existingIdx, 1);
+      draft.workers.unshift(existing);
+      return { ...existing };
+    }
+
+    const created: DelegatedWorker = {
+      id: createShortId(params.idPrefix ?? "coord"),
+      agentId: params.agentId,
+      workspaceId: params.workspaceId,
+      title: params.title,
+      cwd: params.cwd,
+      provider: params.provider,
+      isolation: "local",
+      status: "running",
+      goal: params.goal.slice(0, 1000),
+      notifyChiefOnFinish: params.notifyChiefOnFinish,
+      createdAt: params.nowIso,
+      updatedAt: params.nowIso,
+      pendingCoordinatorReport: true,
+    };
+    draft.workers.unshift(created);
+    return { ...created };
+  }
+
+  /**
+   * Discover a healthy resident AI Company Coordinator (`总控` / `lead`) in `targetCwd`
+   * via `.company/roster.md` (canonical source of truth) and live Paseo agent labels/titles.
+   */
+  async resolveCompanyCoordinator(
+    targetCwd: string,
+    opts?: {
+      callerAgentId?: string;
+      callerLabels?: Record<string, string>;
+    },
+  ): Promise<{
+    agentId: string;
+    title: string;
+    cwd: string;
+    workspaceId: string | null;
+    modelUsed?: string;
+    source: "company_roster" | "agent_labels";
+  } | null> {
+    if (!this.paseo || !targetCwd?.trim()) return null;
+    const normTargetCwd = path.resolve(expandHomePath(targetCwd));
+    if (!(await pathExists(normTargetCwd))) return null;
+
+    const companyDir = path.join(normTargetCwd, ".company");
+    const hasCompanyDir = await pathExists(companyDir);
+    let rosterCoordinator: ReturnType<typeof parseCompanyCoordinatorFromRoster> = null;
+    if (hasCompanyDir) {
+      const rosterText = await fs
+        .readFile(path.join(companyDir, "roster.md"), "utf8")
+        .catch(() => "");
+      if (rosterText) {
+        rosterCoordinator = parseCompanyCoordinatorFromRoster(rosterText);
+      }
+    }
+
+    // Prevent infinite self-delegation loops when a company agent in the same workspace calls delegate_task
+    const hasCallerCompanyRole = (labels?: Record<string, unknown>): boolean => {
+      if (!labels || labels["paseo-bot/role"]) return false;
+      return Boolean(
+        labels.company ||
+          labels.role ||
+          labels.dept ||
+          labels["company.role"] ||
+          labels["paseo-company/role"] ||
+          labels["paseo-company/dept"],
+      );
+    };
+
+    if (opts?.callerAgentId) {
+      if (
+        rosterCoordinator?.agentId &&
+        opts.callerAgentId.toLowerCase().startsWith(rosterCoordinator.agentId.toLowerCase())
+      ) {
+        return null;
+      }
+      if (hasCallerCompanyRole(opts.callerLabels)) {
+        const callerSnap = await this.paseo.agents
+          .ref(opts.callerAgentId)
+          .refresh()
+          .catch(() => null);
+        const callerCwd = callerSnap?.agent?.cwd
+          ? path.resolve(expandHomePath(callerSnap.agent.cwd))
+          : "";
+        if (!callerCwd || callerCwd === normTargetCwd) {
+          return null;
+        }
+      } else {
+        const callerSnap = await this.paseo.agents
+          .ref(opts.callerAgentId)
+          .refresh()
+          .catch(() => null);
+        const snapLabels = (callerSnap?.agent as unknown as { labels?: Record<string, unknown> })
+          ?.labels;
+        const callerCwd = callerSnap?.agent?.cwd
+          ? path.resolve(expandHomePath(callerSnap.agent.cwd))
+          : "";
+        if (callerCwd === normTargetCwd && hasCallerCompanyRole(snapLabels)) {
+          return null;
+        }
+      }
+    }
+
+    const verifyCandidate = async (
+      candidateId: string,
+      fallbackTitle: string | undefined,
+      source: "company_roster" | "agent_labels",
+    ) => {
+      if (!this.paseo || !candidateId) return null;
+      if (opts?.callerAgentId && candidateId === opts.callerAgentId) return null;
+      const refreshed = await this.paseo.agents
+        .ref(candidateId)
+        .refresh()
+        .catch(() => null);
+      if (!refreshed || refreshed.agent.archivedAt || refreshed.agent.status === "error") {
+        return null;
+      }
+      const agentRec = refreshed.agent as unknown as Record<string, unknown>;
+      if (agentRec.background) return null;
+      const labels =
+        agentRec.labels && typeof agentRec.labels === "object" && !Array.isArray(agentRec.labels)
+          ? (agentRec.labels as Record<string, unknown>)
+          : undefined;
+      if (labels?.["paseo-bot/role"]) return null;
+
+      const actualCwd =
+        typeof refreshed.agent.cwd === "string" && refreshed.agent.cwd.trim()
+          ? path.resolve(expandHomePath(refreshed.agent.cwd))
+          : normTargetCwd;
+      if (actualCwd !== normTargetCwd) return null;
+
+      const rawTitle =
+        (typeof refreshed.agent.title === "string" && refreshed.agent.title.trim()) ||
+        (fallbackTitle && fallbackTitle.trim()) ||
+        "总控";
+      return {
+        agentId: refreshed.agent.id,
+        title: cleanTaskTitle(rawTitle) || "总控",
+        cwd: normTargetCwd,
+        workspaceId: refreshed.agent.workspaceId ?? null,
+        modelUsed: formatAgentModelPair(refreshed.agent),
+        source,
+      };
+    };
+
+    // 1. Fast-path: canonical full UUID in `.company/roster.md` (works even for hibernated/closed sessions)
+    if (rosterCoordinator?.agentId && rosterCoordinator.agentId.length >= 32) {
+      const verified = await verifyCandidate(
+        rosterCoordinator.agentId,
+        rosterCoordinator.roleTitle,
+        "company_roster",
+      );
+      if (verified) return verified;
+    }
+
+    // 2. Live Paseo agents list fallback (covers short roster prefixes or rotated lead sessions)
+    const candidates = await this.listRoutableAgentCandidates();
+    const picked = pickBestCompanyCoordinatorCandidate({
+      targetCwd: normTargetCwd,
+      candidates,
+      rosterCoordinator,
+      hasCompanyDir,
+      excludeAgentId: opts?.callerAgentId,
+    });
+    if (picked) {
+      const matchedRosterPrefix = Boolean(
+        rosterCoordinator?.agentId &&
+          picked.id.toLowerCase().startsWith(rosterCoordinator.agentId.toLowerCase()),
+      );
+      const verified = await verifyCandidate(
+        picked.id,
+        picked.title || rosterCoordinator?.roleTitle,
+        matchedRosterPrefix ? "company_roster" : "agent_labels",
+      );
+      if (verified) return verified;
+    }
+
+    return null;
   }
 
   async executeFeedAction(input: {
@@ -3053,6 +3279,14 @@ export class ProactiveEngine {
     return { ok: true, executionAgentId, promotedTriggerName };
   }
 
+  private buildChiefConfigKey(): string {
+    return [
+      this.settings.chiefProvider.trim(),
+      this.settings.chiefModeId.trim(),
+      this.settings.homeCwd.trim(),
+    ].join("|");
+  }
+
   async ensureChiefBot(opts?: {
     reset?: boolean;
     provider?: string;
@@ -3062,11 +3296,17 @@ export class ProactiveEngine {
     created: boolean;
     modelUsed?: string;
   }> {
-    if (this.ensureChiefInFlight && !opts?.reset) {
+    const requestedProvider = opts?.provider?.trim() || "";
+    const hasDifferentProviderOverride =
+      Boolean(requestedProvider) &&
+      requestedProvider.toLowerCase() !== this.settings.chiefProvider.trim().toLowerCase();
+    if (this.ensureChiefInFlight && !opts?.reset && !hasDifferentProviderOverride) {
       return this.ensureChiefInFlight;
     }
     const task = this.ensureChiefBotInternal(opts);
-    this.ensureChiefInFlight = task;
+    if (!opts?.reset && !hasDifferentProviderOverride) {
+      this.ensureChiefInFlight = task;
+    }
     try {
       return await task;
     } finally {
@@ -3089,16 +3329,22 @@ export class ProactiveEngine {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
 
+    const chiefConfigKey = this.buildChiefConfigKey();
+    const requestedProvider = opts?.provider?.trim() || "";
+    const hasDifferentProviderOverride =
+      Boolean(requestedProvider) &&
+      requestedProvider.toLowerCase() !== this.settings.chiefProvider.trim().toLowerCase();
+
     const expandedHome = expandHomePath(this.settings.homeCwd);
     const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
     const launch = await this.resolveLaunchConfig(
-      opts?.provider?.trim() || this.settings.chiefProvider,
+      requestedProvider || this.settings.chiefProvider,
       this.settings.chiefModeId,
       homeCwd,
     );
 
     const state = await this.store.load();
-    if (!opts?.reset && state.chiefAgentId) {
+    if (!opts?.reset && !hasDifferentProviderOverride && state.chiefAgentId) {
       const handle = this.paseo.agents.ref(state.chiefAgentId);
       const refreshed = await handle.refresh().catch(() => null);
       if (
@@ -3106,14 +3352,20 @@ export class ProactiveEngine {
         !refreshed.agent.archivedAt &&
         refreshed.agent.status !== "error" &&
         refreshed.agent.status !== "closed" &&
+        this.buildChiefConfigKey() === chiefConfigKey &&
         doesAgentMatchExpectedConfig(refreshed.agent, {
           providerModel: launch.provider,
           cwd: homeCwd,
         })
       ) {
-        if (refreshed.agent.workspaceId !== state.chiefWorkspaceId) {
+        if (
+          refreshed.agent.workspaceId !== state.chiefWorkspaceId &&
+          this.buildChiefConfigKey() === chiefConfigKey
+        ) {
           await this.store.mutate((draft) => {
-            draft.chiefWorkspaceId = refreshed.agent.workspaceId ?? null;
+            if (draft.chiefAgentId === refreshed.agent.id) {
+              draft.chiefWorkspaceId = refreshed.agent.workspaceId ?? null;
+            }
           });
           await this.broadcastSnapshot();
         }
@@ -3153,11 +3405,18 @@ export class ProactiveEngine {
     );
 
     const workspaceId = chief.workspaceId ?? workspace.id;
-    await this.store.mutate((draft) => {
-      draft.chiefAgentId = chief.id;
-      draft.chiefWorkspaceId = workspaceId;
-    });
-    await this.broadcastSnapshot();
+    const shouldPersistDefaultChief =
+      !hasDifferentProviderOverride &&
+      this.buildChiefConfigKey() === chiefConfigKey &&
+      (!requestedProvider ||
+        requestedProvider.toLowerCase() === this.settings.chiefProvider.trim().toLowerCase());
+    if (shouldPersistDefaultChief) {
+      await this.store.mutate((draft) => {
+        draft.chiefAgentId = chief.id;
+        draft.chiefWorkspaceId = workspaceId;
+      });
+      await this.broadcastSnapshot();
+    }
 
     return { agentId: chief.id, workspaceId, created: true, modelUsed: launch.provider };
   }
@@ -3349,6 +3608,57 @@ export class ProactiveEngine {
           : (await pathExists(expandedHomeCwd))
             ? expandedHomeCwd
             : os.homedir();
+
+    if (
+      !input.skipDirectSessionRouting &&
+      shouldPreferDirectCoordinatorHandoff(effectiveWishText) &&
+      path.resolve(targetCwd) !== path.resolve(expandedHomeCwd)
+    ) {
+      const coordinator = await this.resolveCompanyCoordinator(targetCwd);
+      if (coordinator) {
+        const coordPrompt = [
+          `[来自 Paseo Bot 的项目任务指派]`,
+          effectiveWishText + contextNote + refBlock,
+        ].join("\n");
+        await paseo.agents
+          .ref(coordinator.agentId)
+          .send(coordPrompt, attachedImages.length > 0 ? { images: attachedImages } : undefined);
+        const nowIso = new Date().toISOString();
+        const coordTitle = coordinator.title.slice(0, 28) || "总控";
+        const feedItem = await this.pushFeed({
+          level: "worker_update",
+          title: `已交由总控：${coordTitle} · ${baseLabel}`,
+          summary: feedSummaryText,
+          inProgress: true,
+          unread: false,
+          agentId: coordinator.agentId,
+          workspaceId: coordinator.workspaceId ?? undefined,
+          notifyDesktop: false,
+          appendChiefTimeline: false,
+          beforeMutate: (draft) => {
+            this.upsertCoordinatorWorkerDraft(draft, {
+              agentId: coordinator.agentId,
+              workspaceId: coordinator.workspaceId ?? undefined,
+              title: coordTitle,
+              cwd: coordinator.cwd,
+              provider: coordinator.modelUsed || this.settings.chiefProvider,
+              goal: feedSummaryText,
+              notifyChiefOnFinish: false,
+              nowIso,
+              idPrefix: "coord",
+            });
+          },
+        });
+        return {
+          agentId: coordinator.agentId,
+          workspaceId: coordinator.workspaceId,
+          feedId: feedItem.id,
+          reusedSession: true,
+          sessionTitle: coordTitle,
+          modelUsed: coordinator.modelUsed,
+        };
+      }
+    }
 
     const preferredProvider = input.provider?.trim() || this.settings.chiefProvider;
     const wishWorkerId = createShortId("wish");
@@ -3643,12 +3953,14 @@ export class ProactiveEngine {
   }): Promise<{
     handle: ReturnType<PaseoApi["agents"]["ref"]>;
     modelUsed: string;
+    ephemeral?: boolean;
   }> {
-    if (this.ensureL1InFlight && !opts?.reset && !opts?.providerOverride) {
+    const hasOverride = Boolean(opts?.providerOverride?.trim());
+    if (this.ensureL1InFlight && !opts?.reset && !hasOverride) {
       return this.ensureL1InFlight;
     }
     const task = this.ensureWarmL1AgentInternal(opts);
-    if (!opts?.reset && !opts?.providerOverride) {
+    if (!opts?.reset && !hasOverride) {
       this.ensureL1InFlight = task;
     }
     try {
@@ -3660,12 +3972,14 @@ export class ProactiveEngine {
     }
   }
 
-  private buildL1ConfigKey(cwd: string): string {
+  private buildL1ConfigKey(): string {
     return [
       this.settings.fastProvider.trim(),
       this.settings.fastFallbackProvider.trim(),
       this.settings.fastThinking.trim(),
-      cwd,
+      this.settings.homeCwd.trim(),
+      this.settings.butlerName.trim(),
+      this.settings.userName.trim(),
     ].join("|");
   }
 
@@ -3693,21 +4007,23 @@ export class ProactiveEngine {
   }): Promise<{
     handle: ReturnType<PaseoApi["agents"]["ref"]>;
     modelUsed: string;
+    ephemeral?: boolean;
   }> {
     if (!this.paseo) {
       throw new Error("Paseo daemon connection is not initialized yet");
     }
 
+    const cleanOverride = opts?.providerOverride?.trim() || undefined;
+    const configKey = this.buildL1ConfigKey();
     const expandedHome = expandHomePath(this.settings.homeCwd);
     const homeCwd = (await pathExists(expandedHome)) ? expandedHome : os.homedir();
     await this.ensureProviderCatalog(false);
     const expectedPlan = resolveTierProviderChain("L1", this.settings, this.cachedProviders, {
-      providerOverride: opts?.providerOverride,
+      providerOverride: cleanOverride,
     });
-    const configKey = this.buildL1ConfigKey(homeCwd);
 
     const state = await this.store.load();
-    if (!opts?.reset && !opts?.providerOverride && state.l1AgentId) {
+    if (!opts?.reset && !cleanOverride && state.l1AgentId) {
       const existingHandle = this.paseo.agents.ref(state.l1AgentId);
       const refreshed = await existingHandle.refresh().catch(() => null);
       const isHealthy =
@@ -3717,6 +4033,7 @@ export class ProactiveEngine {
         refreshed!.agent.status !== "closed";
       const matchesConfig =
         isHealthy &&
+        this.buildL1ConfigKey() === configKey &&
         doesAgentMatchExpectedConfig(refreshed!.agent, {
           providerModel: expectedPlan.chosenProvider,
           allowedFallbackModel:
@@ -3730,7 +4047,7 @@ export class ProactiveEngine {
       if (isHealthy && matchesConfig) {
         const modelUsed =
           formatAgentModelPair(refreshed!.agent) || expectedPlan.chosenProvider;
-        return { handle: existingHandle, modelUsed };
+        return { handle: existingHandle, modelUsed, ephemeral: false };
       }
 
       if (
@@ -3773,29 +4090,30 @@ export class ProactiveEngine {
       labels: {
         "paseo-bot/role": "butler-l1",
       },
-      providerOverride: opts?.providerOverride,
+      providerOverride: cleanOverride,
     });
 
-    if (!opts?.providerOverride) {
-      if (this.buildL1ConfigKey(homeCwd) === configKey) {
-        if (launched.modelUsed !== expectedPlan.chosenProvider) {
-          this.l1FallbackConfigKey = configKey;
-          this.l1FallbackModelUsed = launched.modelUsed;
-        } else {
-          this.l1FallbackConfigKey = null;
-          this.l1FallbackModelUsed = null;
-        }
-        await this.store.mutate((draft) => {
-          draft.l1AgentId = launched.handle.id;
-        });
+    const ephemeral = Boolean(cleanOverride) || this.buildL1ConfigKey() !== configKey;
+    if (!ephemeral) {
+      if (
+        launched.modelUsed.trim().toLowerCase() !==
+        expectedPlan.chosenProvider.trim().toLowerCase()
+      ) {
+        this.l1FallbackConfigKey = configKey;
+        this.l1FallbackModelUsed = launched.modelUsed;
       } else {
-        this.archiveBackgroundSessionIfIdle(launched.handle.id);
+        this.l1FallbackConfigKey = null;
+        this.l1FallbackModelUsed = null;
       }
+      await this.store.mutate((draft) => {
+        draft.l1AgentId = launched.handle.id;
+      });
     }
 
     return {
       handle: launched.handle,
       modelUsed: launched.modelUsed,
+      ephemeral,
     };
   }
 
@@ -3933,6 +4251,77 @@ export class ProactiveEngine {
           params.brief,
           memoryContent,
         );
+        const normHome = path.resolve(expandHomePath(this.settings.homeCwd));
+
+        // If escalated/dispatched task targets a project workspace with a resident Company Coordinator,
+        // hand off directly to that coordinator instead of spawning an isolated temporary worker.
+        if (
+          this.paseo &&
+          !params.providerOverride &&
+          shouldPreferDirectCoordinatorHandoff(params.brief) &&
+          path.resolve(targetCwd) !== normHome
+        ) {
+          const coordinator = await this.resolveCompanyCoordinator(targetCwd);
+          if (coordinator) {
+            await this.paseo.agents.ref(coordinator.agentId).send(
+              `[来自 Paseo Bot 对话流的项目任务指派]\n${params.brief}`,
+              params.attachedImages && params.attachedImages.length > 0
+                ? { images: params.attachedImages }
+                : undefined,
+            );
+            const latencyMs = Math.max(1, Date.now() - startMs);
+            const nowIso = new Date().toISOString();
+            const coordTitle = coordinator.title.slice(0, 28) || "总控";
+            await this.store.mutate((draft) => {
+              const ack = draft.messages.find((m) => m.id === params.ackMessageId);
+              if (ack) {
+                ack.status = "done";
+                ack.links = [];
+              }
+              this.upsertCoordinatorWorkerDraft(draft, {
+                agentId: coordinator.agentId,
+                workspaceId: coordinator.workspaceId ?? undefined,
+                title: coordTitle,
+                cwd: coordinator.cwd,
+                provider: coordinator.modelUsed || this.settings.execProvider,
+                goal: params.brief,
+                notifyChiefOnFinish: false,
+                nowIso,
+                idPrefix: "coord",
+              });
+              draft.routingTelemetry.l0Hits += 1;
+              draft.routingTelemetry.lastTier = "L0";
+              draft.routingTelemetry.lastModelUsed = coordinator.modelUsed;
+              draft.routingTelemetry.lastLatencyMs = latencyMs;
+              draft.messages.push({
+                id: createShortId("msg"),
+                createdAt: nowIso,
+                role: "assistant",
+                kind: "chat",
+                text: `已识别到对应项目，直接交由「**${coordTitle}**」统筹执行（[查看总控会话](paseo://agent/${coordinator.agentId})），完成后我会把结论同步给你。`,
+                images: [],
+                links: [
+                  {
+                    label: "查看总控会话",
+                    url: `paseo://agent/${coordinator.agentId}`,
+                    kind: "agent",
+                  },
+                ],
+                quickActions: [],
+                tier: "L0",
+                modelUsed: coordinator.modelUsed,
+                latencyMs,
+                status: "done",
+                replyToMessageId: params.ackMessageId,
+                agentId: coordinator.agentId,
+                workspaceId: coordinator.workspaceId ?? undefined,
+                unread: true,
+              });
+            });
+            await this.broadcastSnapshot();
+            return;
+          }
+        }
         const butlerName = this.getEffectiveButlerName(state);
         const userName = this.getEffectiveUserName(state);
         const systemPrompt = await buildButlerExecSystemPrompt(
@@ -4418,8 +4807,86 @@ export class ProactiveEngine {
       }
     }
 
-    // Branch 3: L0 Direct Escalation to L2 / L3 (Two-Beat Handoff)
+    // Branch 3: L0 Direct Escalation to L2 / L3 (or Direct Handoff to Resident Company Coordinator)
     if (decision.tier === "L2" || decision.tier === "L3") {
+      if (
+        !input.forceTier &&
+        !input.providerOverride &&
+        cleanText &&
+        shouldPreferDirectCoordinatorHandoff(cleanText)
+      ) {
+        const candidateCwd = await this.resolveTargetExecutionCwd(
+          input.cwd,
+          cleanText,
+          memoryContent,
+        );
+        const normHome = path.resolve(expandHomePath(this.settings.homeCwd));
+        if (path.resolve(candidateCwd) !== normHome) {
+          const coordinator = await this.resolveCompanyCoordinator(candidateCwd);
+          if (coordinator) {
+            const coordTitle = coordinator.title.slice(0, 28) || "总控";
+            await this.paseo.agents.ref(coordinator.agentId).send(
+              `[来自 Paseo Bot 对话流的项目任务指派]\n${cleanText}`,
+              attachedImages.length > 0 ? { images: attachedImages } : undefined,
+            );
+            const replyMsgId = createShortId("msg");
+            const nowIso = new Date().toISOString();
+            const latencyMs = Math.max(0, Date.now() - startMs);
+            await this.store.mutate((draft) => {
+              draft.messages.push(userMsg);
+              draft.messages.push({
+                id: replyMsgId,
+                createdAt: nowIso,
+                role: "assistant",
+                kind: "chat",
+                text: `已识别到对应项目，直接交由「**${coordTitle}**」统筹执行（[查看总控会话](paseo://agent/${coordinator.agentId})），完成后我会把结论同步给你。`,
+                images: [],
+                links: [
+                  {
+                    label: "查看总控会话",
+                    url: `paseo://agent/${coordinator.agentId}`,
+                    kind: "agent",
+                  },
+                ],
+                quickActions: [],
+                tier: "L0",
+                modelUsed: coordinator.modelUsed,
+                latencyMs,
+                status: "done",
+                replyToMessageId: userMsg.id,
+                agentId: coordinator.agentId,
+                workspaceId: coordinator.workspaceId ?? undefined,
+                unread: false,
+              });
+              draft.routingTelemetry.l0Hits += 1;
+              draft.routingTelemetry.lastTier = "L0";
+              draft.routingTelemetry.lastModelUsed = coordinator.modelUsed;
+              draft.routingTelemetry.lastLatencyMs = latencyMs;
+              this.upsertCoordinatorWorkerDraft(draft, {
+                agentId: coordinator.agentId,
+                workspaceId: coordinator.workspaceId ?? undefined,
+                title: coordTitle,
+                cwd: coordinator.cwd,
+                provider: coordinator.modelUsed || this.settings.execProvider,
+                goal: cleanText,
+                notifyChiefOnFinish: false,
+                nowIso,
+                idPrefix: "coord",
+              });
+            });
+            await this.broadcastSnapshot();
+            return {
+              userMessageId: userMsg.id,
+              assistantMessageId: replyMsgId,
+              tier: "L0",
+              modelUsed: coordinator.modelUsed,
+              agentId: coordinator.agentId,
+              routedSessionTitle: coordTitle,
+            };
+          }
+        }
+      }
+
       const targetTier = decision.tier;
       const plan = resolveTierProviderChain(
         targetTier,
@@ -4502,11 +4969,17 @@ export class ProactiveEngine {
       .join("\n\n");
 
     let l1AgentIdForCleanup: string | null = null;
+    let l1Ephemeral = false;
     try {
-      const { handle: l1Handle, modelUsed: l1ModelUsed } = await this.ensureWarmL1Agent({
+      const {
+        handle: l1Handle,
+        modelUsed: l1ModelUsed,
+        ephemeral,
+      } = await this.ensureWarmL1Agent({
         providerOverride: input.providerOverride,
       });
       l1AgentIdForCleanup = l1Handle.id;
+      l1Ephemeral = Boolean(ephemeral);
       this.l1Escalations.delete(l1Handle.id);
 
       let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4683,7 +5156,7 @@ export class ProactiveEngine {
       await this.store.mutate((draft) => {
         if (l1AgentIdForCleanup && draft.l1AgentId === l1AgentIdForCleanup) {
           draft.l1AgentId = null;
-        } else if (!l1AgentIdForCleanup) {
+        } else if (!l1AgentIdForCleanup && !input.providerOverride?.trim()) {
           draft.l1AgentId = null;
         }
         draft.routingTelemetry.fallbackCount += 1;
@@ -4705,6 +5178,15 @@ export class ProactiveEngine {
         escalatedTo: "L2",
         modelUsed: fallbackPlan.chosenProvider,
       };
+    } finally {
+      if (
+        l1Ephemeral &&
+        l1AgentIdForCleanup &&
+        !this.stopped &&
+        this.store.get().l1AgentId !== l1AgentIdForCleanup
+      ) {
+        this.archiveBackgroundSessionIfIdle(l1AgentIdForCleanup);
+      }
     }
   }
 
@@ -4716,6 +5198,10 @@ export class ProactiveEngine {
     provider?: string;
     modeId?: string;
     isolation?: "local" | "worktree";
+    targetAgentId?: string;
+    preferCoordinator?: boolean;
+    callerAgentId?: string;
+    callerLabels?: Record<string, string>;
     notifyChiefOnFinish?: boolean;
   }): Promise<DelegatedWorker> {
     if (!this.paseo) {
@@ -4730,6 +5216,124 @@ export class ProactiveEngine {
         ? expandedHome
         : os.homedir();
     const isolation = input.isolation ?? "local";
+    const notifyChief = input.notifyChiefOnFinish ?? true;
+
+    // 1. Explicit targetAgentId direct delivery
+    const explicitTargetHint = input.targetAgentId?.trim();
+    if (explicitTargetHint && isolation === "local") {
+      let resolvedTargetId = explicitTargetHint;
+      if (explicitTargetHint.length < 32) {
+        const candidates = await this.listRoutableAgentCandidates();
+        const byPrefix = candidates.find((c) =>
+          c.id.toLowerCase().startsWith(explicitTargetHint.toLowerCase()),
+        );
+        if (byPrefix) resolvedTargetId = byPrefix.id;
+      }
+      if (resolvedTargetId !== input.callerAgentId) {
+        const handle = this.paseo.agents.ref(resolvedTargetId);
+        const refreshed = await handle.refresh().catch(() => null);
+        if (
+          refreshed &&
+          !refreshed.agent.archivedAt &&
+          refreshed.agent.status !== "error"
+        ) {
+          await handle.send(
+            [
+              `[Paseo Bot 跨工作区任务委派]`,
+              `任务标题：${input.title}`,
+              `目标工作区：${targetCwd}`,
+              ``,
+              input.prompt,
+            ].join("\n"),
+            input.images && input.images.length > 0 ? { images: input.images } : undefined,
+          );
+          const nowIso = new Date().toISOString();
+          const actualModel =
+            formatAgentModelPair(refreshed.agent) || this.settings.defaultWorkerProvider;
+          const targetTitle =
+            (typeof refreshed.agent.title === "string" &&
+              cleanTaskTitle(refreshed.agent.title)) ||
+            input.title;
+          let savedRecord!: DelegatedWorker;
+          await this.pushFeed({
+            level: "worker_update",
+            title: `正在续接：${targetTitle} · ${cleanTaskTitle(input.title)}`,
+            summary: `工作目录：${targetCwd} (session ${resolvedTargetId.slice(0, 8)})\n模型：${actualModel}`,
+            inProgress: true,
+            unread: false,
+            agentId: resolvedTargetId,
+            workspaceId: refreshed.agent.workspaceId ?? undefined,
+            notifyDesktop: false,
+            appendChiefTimeline: false,
+            beforeMutate: (draft) => {
+              savedRecord = this.upsertCoordinatorWorkerDraft(draft, {
+                agentId: resolvedTargetId,
+                workspaceId: refreshed.agent.workspaceId ?? undefined,
+                title: targetTitle,
+                cwd: refreshed.agent.cwd || targetCwd,
+                provider: actualModel,
+                goal: input.prompt,
+                notifyChiefOnFinish: notifyChief,
+                nowIso,
+                idPrefix: "coord",
+              });
+            },
+          });
+          return savedRecord;
+        }
+      }
+    }
+
+    // 2. Auto-detect resident AI Company Coordinator (`总控`) in target workspace
+    if (isolation === "local" && input.preferCoordinator !== false) {
+      const coordinator = await this.resolveCompanyCoordinator(targetCwd, {
+        callerAgentId: input.callerAgentId,
+        callerLabels: input.callerLabels,
+      });
+      if (coordinator) {
+        await this.paseo.agents.ref(coordinator.agentId).send(
+          [
+            `[Paseo Bot 跨工作区任务委派 · 交由总控统筹]`,
+            `任务标题：${input.title}`,
+            `目标工作区：${coordinator.cwd}`,
+            ``,
+            input.prompt,
+          ].join("\n"),
+          input.images && input.images.length > 0 ? { images: input.images } : undefined,
+        );
+        const nowIso = new Date().toISOString();
+        const actualModel = coordinator.modelUsed || this.settings.defaultWorkerProvider;
+        const coordTitle = coordinator.title || "总控";
+        let savedRecord!: DelegatedWorker;
+        await this.pushFeed({
+          level: "worker_update",
+          title: `已交由总控执行：${coordTitle} · ${cleanTaskTitle(input.title)}`,
+          summary: `工作目录：${coordinator.cwd} (company coordinator)\n模型：${actualModel}`,
+          inProgress: true,
+          unread: false,
+          agentId: coordinator.agentId,
+          workspaceId: coordinator.workspaceId ?? undefined,
+          notifyDesktop: false,
+          appendChiefTimeline: false,
+          beforeMutate: (draft) => {
+            savedRecord = this.upsertCoordinatorWorkerDraft(draft, {
+              agentId: coordinator.agentId,
+              workspaceId: coordinator.workspaceId ?? undefined,
+              title: coordTitle,
+              cwd: coordinator.cwd,
+              provider: actualModel,
+              goal: input.prompt,
+              notifyChiefOnFinish: notifyChief,
+              nowIso,
+              idPrefix: "coord",
+            });
+          },
+        });
+        return savedRecord;
+      }
+    }
+
+    // 3. Fallback: launch a clean standalone worker session
     const workerId = createShortId("wrk");
     const preferredWorkerModeId = input.modeId?.trim() || this.settings.defaultWorkerModeId;
     const launched = await this.launchTieredAgentWithFallback({
@@ -4759,7 +5363,7 @@ export class ProactiveEngine {
       isolation,
       status: "running",
       goal: input.prompt.slice(0, 1000),
-      notifyChiefOnFinish: input.notifyChiefOnFinish ?? true,
+      notifyChiefOnFinish: notifyChief,
       createdAt: nowIso,
       updatedAt: nowIso,
     };
@@ -5727,6 +6331,7 @@ export class ProactiveEngine {
               found.status = nextStatus;
               found.updatedAt = new Date().toISOString();
               found.summary = shortSummary;
+              found.pendingCoordinatorReport = false;
             }
             chiefId = draft.chiefAgentId;
           });
@@ -5739,10 +6344,13 @@ export class ProactiveEngine {
             labels: agentLabels,
             isRepeatInteractiveTurn,
             workerId: worker.id,
+            pendingCoordinatorReport: Boolean(worker.pendingCoordinatorReport),
           });
 
           if (!streamDecision.shouldSync) {
-            // ADR-004: silently finalize worker status without polluting feed, messages, or desktop notifications
+            // ADR-004: silently finalize worker status without polluting feed, messages, or desktop notifications.
+            // Note: `pendingCoordinatorReport` intentionally stays true if a coordinator only emitted an
+            // initial `[DISPATCH]` / `已派单给...部` turn, so the downstream final conclusion turn will sync!
             const nowIso = new Date().toISOString();
             await this.store.mutate((draft) => {
               draft.routingTelemetry.l0Hits += 1;
@@ -5792,6 +6400,7 @@ export class ProactiveEngine {
                 found.status = nextStatus;
                 found.updatedAt = new Date().toISOString();
                 found.summary = condensed.text;
+                found.pendingCoordinatorReport = false;
               }
               chiefId = draft.chiefAgentId;
             },

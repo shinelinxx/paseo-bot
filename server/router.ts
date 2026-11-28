@@ -100,7 +100,30 @@ const EXPLICIT_PATH_URL_CMD_RE = /(?:~\/|\/Users\/|\/home\/|https?:\/\/|`[^`]{3,
 const TOOL_OR_ACTION_SIGNAL_RE =
   /(?:查一下|帮我查|查一查|核实|检查.*邮箱|看下.*邮件|查.*邮件|cloudflare|tunnel|\bssh\b|服务器|部署|更新.*代码|修复.*bug|跑一下测试|运行测试|整理收件箱|00-inbox|创建.*定时|新建.*规则|每天.*点|每隔?\s*\d+\s*(?:分钟|小时)|监听.*目录|webhook|子任务|工作区进度|汇总.*进度|生成今日汇总|整理工作区|整理会话|\bgithub\b|\bpr\b|\bcommit\b|git\s+(?:status|diff|log))/iu;
 const WORKSPACE_EXEC_VERB_RE =
-  /(?:检查|查看|看下|看看|整理|归档|修复|修改|更新|跑|运行|执行|同步|汇总|核对|排查|优化|清理|统计|报单|订单|草稿|check|inspect|fix|update|run|sync)/iu;
+  /(?:检查|查看|看下|看看|整理|归档|修复|修改|更新|跑|运行|执行|同步|汇总|核对|排查|优化|清理|统计|报单|订单|草稿|派给|交给|委派|转交|派发|交由|分派|安排|推进|开发|实现|新增|增加|支持|加上|插个|处理|跟进|接入|重构|改造|调研|盘点|分析|评估|check|inspect|fix|update|run|sync|delegate|dispatch|assign|handoff|implement|add|build)/iu;
+
+const EXPLICIT_COMPANY_HANDOFF_RE =
+  /(?:派给|交给|委派|转交|派发|交由|分派给?|(?:让|请|叫|找)\s*[^\n，,。]{1,24}?(?:总控|总舵|公司|工作室))/iu;
+
+const PERSONAL_BUTLER_CHANNEL_SIGNAL_RE =
+  /(?:查.*邮件|看下.*邮件|检查.*邮箱|gmail|qq\s*邮箱|(?:创建|新建|设置|设个|添加|修改|暂停|恢复|删除|停用)[^\n，,。]{0,16}(?:定时|计划|规则|监听|webhook|trigger))/iu;
+
+/**
+ * Decide whether an actionable workspace message should be handed directly to the
+ * target project's resident Company Coordinator (`总控`) instead of running Paseo Bot's
+ * own personal-channel L2 executor first.
+ */
+export function shouldPreferDirectCoordinatorHandoff(text: string): boolean {
+  const clean = (text ?? "").trim();
+  if (!clean) return false;
+  if (EXPLICIT_COMPANY_HANDOFF_RE.test(clean)) {
+    return true;
+  }
+  if (PERSONAL_BUTLER_CHANNEL_SIGNAL_RE.test(clean)) {
+    return false;
+  }
+  return true;
+}
 
 export function isDeepAnalysisSignal(text: string): boolean {
   const clean = text.trim();
@@ -231,12 +254,14 @@ export function classifyMessageTier(input: ClassifyMessageInput): RoutingDecisio
   }
   const cleanOverride = input.providerOverride?.trim();
   if (cleanOverride) {
+    const lowerOverride = cleanOverride.toLowerCase();
     let tier: "L1" | "L2" | "L3" = "L2";
-    if (cleanOverride === deepProvider) {
+    if (lowerOverride === deepProvider.trim().toLowerCase()) {
       tier = "L3";
     } else if (
-      cleanOverride === fastProvider ||
-      cleanOverride === fastFallbackProvider
+      lowerOverride === fastProvider.trim().toLowerCase() ||
+      lowerOverride === fastFallbackProvider.trim().toLowerCase() ||
+      lowerOverride === DEFAULT_BOT_SETTINGS.fastProvider.toLowerCase()
     ) {
       tier = "L1";
     }
@@ -552,16 +577,17 @@ export function doesAgentMatchExpectedConfig(
 
   const actualPair = extractAgentModelPair(agent);
   if (!actualPair) return false;
+  const actualPairLower = actualPair.toLowerCase();
 
   const matchesPair = (target: string): boolean => {
-    const cleanTarget = target.trim();
+    const cleanTarget = target.trim().toLowerCase();
     if (!cleanTarget) return false;
     if (cleanTarget.includes("/")) {
-      return actualPair === cleanTarget;
+      return actualPairLower === cleanTarget;
     }
-    const actualProv = actualPair.includes("/")
-      ? actualPair.split("/", 2)[0]
-      : actualPair;
+    const actualProv = actualPairLower.includes("/")
+      ? actualPairLower.split("/", 2)[0]
+      : actualPairLower;
     return actualProv === cleanTarget;
   };
 
@@ -570,8 +596,8 @@ export function doesAgentMatchExpectedConfig(
     Boolean(expected.allowedFallbackModel && matchesPair(expected.allowedFallbackModel));
   if (!modelMatches) return false;
 
-  const expectedThinking = expected.thinkingOptionId?.trim();
-  const actualThinking = extractAgentThinkingOptionId(agent);
+  const expectedThinking = expected.thinkingOptionId?.trim().toLowerCase();
+  const actualThinking = extractAgentThinkingOptionId(agent)?.toLowerCase();
   if (expectedThinking && actualThinking && actualThinking !== expectedThinking) {
     return false;
   }
@@ -626,6 +652,9 @@ const COMPANY_TITLE_OR_ROLE_RE =
 const COMPANY_INTERMEDIATE_CONTENT_RE =
   /(?:\[(?:DISPATCH|HANDOFF|GATE|HEARTBEAT|ESCALATE|BOARD DIRECTIVE)\]|READY_FOR_GATE|原子工单派发|工单交付|质量与风控门禁|正在(?:派工|自测|排查|审阅|修复)|(?:派工|自测|排查|审阅)中)/iu;
 
+const COORDINATOR_DISPATCH_ACK_ONLY_RE =
+  /(?:\[(?:DISPATCH|HANDOFF|GATE|HEARTBEAT|BOARD DIRECTIVE)\]|READY_FOR_GATE|原子工单派发|工单交付|质量与风控门禁|正在(?:派工|自测|排查|审阅|修复)|(?:派工|自测|排查|审阅)中|已(?:立项|拆单|拆解|派单|派发|指派)[^\n。]{0,36}(?:部|组|岗|操作员|执行|跟进|处理)|正在等待[^\n。]{0,24}(?:部|组|岗)|待[^\n。]{0,24}(?:门禁|验收|质控|红队)[^\n。]{0,16}汇报)/iu;
+
 const GENERIC_SECTION_HEADING_RE =
   /^(?:总结|小结|概述|核心结论|结论|执行结果|处理结果|发版说明|发布说明|更新内容|变更摘要|summary|overview|conclusion|result|release\s+notes?)[：:\s]*$/iu;
 
@@ -651,6 +680,7 @@ export interface WorkerTurnStreamInput {
   labels?: Record<string, string>;
   isRepeatInteractiveTurn?: boolean;
   workerId?: string;
+  pendingCoordinatorReport?: boolean;
 }
 
 export interface WorkerTurnStreamEvaluation {
@@ -659,6 +689,7 @@ export interface WorkerTurnStreamEvaluation {
     | "failed_outcome"
     | "empty_or_placeholder"
     | "release_or_milestone"
+    | "coordinator_completion"
     | "company_intermediate_turn"
     | "repeat_interactive_turn"
     | "delegated_first_completion"
@@ -669,7 +700,8 @@ export interface WorkerTurnStreamEvaluation {
  * ADR-004 noise gate for `agent.turn.after` & historical feed projection:
  * - Drops empty/placeholder completions ("处理完成。"), AI company intermediate choreography,
  *   and repeat chat turns inside interactive sessions.
- * - Passes through release/ship/milestone conclusions, failures, and first-time delegated worker completions.
+ * - Passes through release/ship/milestone conclusions, failures, explicit coordinator
+ *   handoff completions (skipping Turn-1 dispatch acks), and first-time delegated worker completions.
  */
 export function evaluateWorkerTurnForStream(
   input: WorkerTurnStreamInput,
@@ -685,6 +717,16 @@ export function evaluateWorkerTurnForStream(
 
   const title = (input.title ?? "").trim();
   const isRelease = hasReleaseOrMilestoneSignal(rawText, title);
+
+  if (input.pendingCoordinatorReport) {
+    if (isRelease) {
+      return { shouldSync: true, reason: "release_or_milestone" };
+    }
+    if (COORDINATOR_DISPATCH_ACK_ONLY_RE.test(rawText)) {
+      return { shouldSync: false, reason: "company_intermediate_turn" };
+    }
+    return { shouldSync: true, reason: "coordinator_completion" };
+  }
 
   const labels = input.labels ?? {};
   const hasCompanyLabel = Boolean(

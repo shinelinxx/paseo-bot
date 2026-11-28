@@ -261,26 +261,46 @@ export function registerBotAgentTools(
   const delegateTaskTool = defineAgentTool({
     name: "paseo_bot_delegate_task",
     description:
-      "Delegate a coding, research, or operational task asynchronously to a worker agent in a target workspace (local directory or isolated git worktree). Paseo Bot automatically monitors completion and collects results.",
+      "Delegate a coding, research, or operational task asynchronously to a target workspace. If the target workspace has a resident AI Company Coordinator ('总控'), Paseo Bot automatically hands the task to that coordinator unless preferCoordinator=false or isolation='worktree'.",
     input: z.object({
       title: z.string().min(1).describe("Short title for the delegated task"),
       cwd: z.string().min(1).describe("Absolute path of the target project/workspace directory"),
-      prompt: z.string().min(1).describe("Complete actionable brief for the worker agent"),
+      prompt: z.string().min(1).describe("Complete actionable brief for the worker or company coordinator"),
       provider: z
         .string()
         .optional()
-        .describe("Optional provider/model override, e.g. codex/gpt-6.2-sol or antigravity/gemini-4-neon"),
+        .describe("Optional provider/model override when spawning a standalone worker"),
       isolation: z
         .enum(["local", "worktree"])
         .optional()
         .describe("Use 'worktree' for isolated git branch work, or 'local' (default)"),
+      targetAgentId: z
+        .string()
+        .optional()
+        .describe("Optional explicit agent/session ID (or prefix) to deliver this task directly into"),
+      preferCoordinator: z
+        .boolean()
+        .optional()
+        .describe("Defaults to true: route to the target project's resident Company Coordinator ('总控') when available"),
       notifyChiefOnFinish: z.boolean().optional(),
     }),
-    async execute(input, { paseo }) {
+    async execute(input, { agent, paseo }) {
       engine.attachPaseo(paseo);
-      const worker = await engine.delegateTask(input);
+      const rawLabels = (agent as unknown as { labels?: unknown }).labels;
+      const callerLabels =
+        rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)
+          ? (rawLabels as Record<string, string>)
+          : undefined;
+      const worker = await engine.delegateTask({
+        ...input,
+        callerAgentId: agent.id,
+        callerLabels,
+      });
+      const routedHint = worker.pendingCoordinatorReport
+        ? `resident company coordinator '${worker.title}' (${worker.agentId}, model: ${worker.provider})`
+        : `worker agent ${worker.agentId} (${worker.isolation}, model: ${worker.provider})`;
       return {
-        text: `Delegated '${worker.title}' to worker agent ${worker.agentId} in ${worker.cwd} (${worker.isolation}, model: ${worker.provider}). Paseo Bot will automatically report when it finishes or needs permission.`,
+        text: `Delegated '${input.title}' to ${routedHint} in ${worker.cwd}. Paseo Bot will automatically report when it finishes or needs permission.`,
         structuredContent: worker,
       };
     },

@@ -180,6 +180,7 @@ export const DelegatedWorkerSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   summary: z.string().optional(),
+  pendingCoordinatorReport: z.boolean().optional(),
 });
 export type DelegatedWorker = z.output<typeof DelegatedWorkerSchema>;
 

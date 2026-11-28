@@ -15,6 +15,13 @@ import {
 import { BotSettingsSchema, DEFAULT_BOT_SETTINGS } from "../shared/settings.ts";
 import { ProactiveEngine } from "../server/engine.ts";
 import {
+  extractMemoryWorkspaceHints,
+  inferWorkspaceAndWatchPath,
+  isCompanyCoordinatorCandidate,
+  parseCompanyCoordinatorFromRoster,
+  pickBestCompanyCoordinatorCandidate,
+} from "../server/intent.ts";
+import {
   buildButlerL1SystemPrompt,
   loadPromptTemplate,
   loadRawPromptTemplate,
@@ -30,6 +37,7 @@ import {
   parseProfilePreferenceFromMemoryNote,
   projectLegacyFeedToMessages,
   resolveTierProviderChain,
+  shouldPreferDirectCoordinatorHandoff,
   type CatalogProviderAvailability,
 } from "../server/router.ts";
 import { BotStateStore } from "../server/storage.ts";
@@ -1946,5 +1954,538 @@ test("Warm L1 & Chief session reuse validates latest provider/model/thinking con
     await engine.stop();
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("AI Company Coordinator ('总控') discovery & direct routing across chat, delegateTask, submitWish, and multi-hop pipeline sync", async () => {
+  // 1. Roster parser handles all real agent-company v2/v3 `.company/roster.md` formats
+  const moneyPrinterRoster = [
+    "# 岗位通讯录（Roster v3）",
+    "> 由 **总控调度** 统管",
+    "| 岗位 / 部门 | 模型 | 权限 | Agent ID | 岗位手册 | 职责 | 状态 |",
+    "|---|---|---|---|---|---|---|",
+    "| **总控调度**（总控） | `antigravity/gemini-4-neon` (`high`) | `accept-edits` | `16b004bb-cb8c-4398-89b0-f06e01869a33` | `.company/roles/lead.md` | 拆单调度 | 待命就绪 |",
+    "| **情报与渠道研发部** | `antigravity/gemini-4-carbon` | `full-access` | `adf70541-34c9-4858-94bd-80fa622f6cc7` | `.company/roles/intel-dev.md` | 研发 | 待命就绪 |",
+  ].join("\n");
+  assert.deepEqual(parseCompanyCoordinatorFromRoster(moneyPrinterRoster), {
+    agentId: "16b004bb-cb8c-4398-89b0-f06e01869a33",
+    roleTitle: "总控调度",
+  });
+
+  const cardConciergeRoster = [
+    "> 由 **首席管家（总控）** 统管",
+    "| 部门 / 岗位 | 模型 | 权限 | Agent ID | 岗位手册 | 状态 |",
+    "|---|---|---|---|---|---|",
+    "| **首席管家（总控）** | `antigravity/gemini-4-neon` | `accept-edits` | `1c6b968a-eaa2-4071-9017-fd5cc962a237` | `.company/roles/lead.md` | 运行中 |",
+  ].join("\n");
+  assert.deepEqual(parseCompanyCoordinatorFromRoster(cardConciergeRoster), {
+    agentId: "1c6b968a-eaa2-4071-9017-fd5cc962a237",
+    roleTitle: "首席管家（总控）",
+  });
+
+  const butlerStudioRoster = [
+    "> 由总控中枢 **[插件] 管家总舵** 统管",
+    "| 岗位 / 部门 | 模型 | 权限 | Agent ID | 岗位手册 | 状态 |",
+    "|---|---|---|---|---|---|",
+    "| [插件] 管家总舵（总控） | `antigravity/gemini-4-neon` | `accept-edits` | `d4dfe8a6-594d-440a-b7a4-daa02ddf1ebf` | `.company/roles/butler-lead.md` | 在线待命 |",
+  ].join("\n");
+  assert.deepEqual(parseCompanyCoordinatorFromRoster(butlerStudioRoster), {
+    agentId: "d4dfe8a6-594d-440a-b7a4-daa02ddf1ebf",
+    roleTitle: "[插件] 管家总舵",
+  });
+
+  // 2. Candidate matcher identifies genuine company leads and rejects non-company hubs like `📌 日常总控 · General`
+  assert.equal(
+    isCompanyCoordinatorCandidate(
+      {
+        id: "hub_general",
+        title: "📌 日常总控 · General",
+        cwd: "/Users/demo/Documents/General",
+        updatedAtMs: 100,
+      },
+      { hasCompanyDir: false },
+    ),
+    false,
+  );
+  assert.equal(
+    isCompanyCoordinatorCandidate(
+      {
+        id: "qqq_lead",
+        title: "产品总控",
+        cwd: "/Users/demo/Documents/qqq-bro-bot",
+        updatedAtMs: 200,
+        labels: { company: "QQQ兄弟会", role: "lead" },
+      },
+      { hasCompanyDir: false },
+    ),
+    true,
+  );
+  assert.equal(
+    pickBestCompanyCoordinatorCandidate({
+      targetCwd: "/Users/demo/Documents/qqq-bro-bot",
+      candidates: [
+        {
+          id: "qqq_dev",
+          title: "网关与前端引擎部",
+          cwd: "/Users/demo/Documents/qqq-bro-bot",
+          updatedAtMs: 300,
+          labels: { company: "QQQ兄弟会", dept: "core-dev" },
+        },
+        {
+          id: "qqq_lead",
+          title: "产品总控",
+          cwd: "/Users/demo/Documents/qqq-bro-bot",
+          updatedAtMs: 200,
+          labels: { company: "QQQ兄弟会", role: "lead" },
+        },
+      ],
+    })?.id,
+    "qqq_lead",
+  );
+
+  // 3. Memory hint extraction & workspace inference cover Section 3 AI companies & paseo-bot disambiguation
+  const sampleMemory = [
+    "## 2. 常用工作区地图",
+    "- **统一日常总控与个人知识库**：`/Users/demo/Documents/KnowledgeBase`",
+    "- **Amazon / 业务自动化**：`/Users/demo/Documents/MoneyPrinter`",
+    "- **Paseo 插件与 MCP 工具区**：`/Users/demo/Documents/paseo`",
+    "## 3. 当前长期关注事项",
+    "- [2026-11-27] - **[2026-11-27] 美亚自动化撸货 AI 公司（`MoneyPrinter`）**：已按 `agent-company` v2 规范在 `/Users/demo/Documents/MoneyPrinter` 组建 5 部门。",
+    "- [2026-11-27] - **[2026-11-28] 卡旅私享管家 AI 公司（`CardConcierge`）成立与知识星球服务迁移**：已按 `agent-company` v2 规范在 `/Users/demo/Documents/card-concierge` 组建 5 部门。",
+    "- [2026-11-27] - **[2026-11-27] QQQ兄弟会自主意识微信群机器人 AI 公司（`qqq-bro-bot`）**：已在 `/Users/demo/Documents/qqq-bro-bot` 创办。",
+  ].join("\n");
+
+  const hints = extractMemoryWorkspaceHints(sampleMemory);
+  assert.ok(hints.some((h) => h.cwd === "/Users/demo/Documents/card-concierge"));
+  assert.ok(hints.some((h) => h.cwd === "/Users/demo/Documents/qqq-bro-bot"));
+
+  assert.equal(
+    inferWorkspaceAndWatchPath(
+      "把这个需求派给美亚撸货公司处理",
+      "/Users/demo/Documents/KnowledgeBase",
+      [],
+      sampleMemory,
+    ).cwd,
+    "/Users/demo/Documents/MoneyPrinter",
+  );
+  assert.equal(
+    inferWorkspaceAndWatchPath(
+      "让卡旅公司帮我盘点年底还没用完的信用卡报销",
+      "/Users/demo/Documents/KnowledgeBase",
+      [],
+      sampleMemory,
+    ).cwd,
+    "/Users/demo/Documents/card-concierge",
+  );
+  assert.equal(
+    inferWorkspaceAndWatchPath(
+      "Paseo Bot 帮我查一下昨天的邮件",
+      "/Users/demo/Documents/KnowledgeBase",
+      [],
+      sampleMemory,
+    ).cwd,
+    "/Users/demo/Documents/KnowledgeBase",
+  );
+  assert.equal(shouldPreferDirectCoordinatorHandoff("帮我查一下邮箱里关于 MoneyPrinter 的邮件"), false);
+  assert.equal(shouldPreferDirectCoordinatorHandoff("派给美亚撸货公司检查一下今日订单对账"), true);
+
+  // 4. End-to-end ProactiveEngine verification
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-company-coord-"));
+  try {
+    const homeDir = path.join(tmpRoot, "KnowledgeBase");
+    const mpDir = path.join(tmpRoot, "MoneyPrinter");
+    const qqqDir = path.join(tmpRoot, "qqq-bro-bot");
+    const plainDir = path.join(tmpRoot, "plain-project");
+    await fs.mkdir(homeDir, { recursive: true });
+    await fs.mkdir(path.join(mpDir, ".company"), { recursive: true });
+    await fs.mkdir(qqqDir, { recursive: true });
+    await fs.mkdir(plainDir, { recursive: true });
+
+    const mpLeadId = "16b004bb-cb8c-4398-89b0-f06e01869a33";
+    const qqqLeadId = "31fe7981-9624-4fe5-99c0-703d6365c6cc";
+
+    await fs.writeFile(
+      path.join(mpDir, ".company", "roster.md"),
+      [
+        "# Roster",
+        "> 由 **总控调度** 统管",
+        "| 岗位 | 模型 | 权限 | Agent ID | 手册 | 状态 |",
+        "|---|---|---|---|---|---|",
+        `| **总控调度**（总控） | \`antigravity/gemini-4-neon\` | \`accept-edits\` | \`${mpLeadId}\` | \`.company/roles/lead.md\` | 待命就绪 |`,
+      ].join("\n"),
+      "utf8",
+    );
+
+    const memPath = path.join(homeDir, "MEMORY.md");
+    await fs.writeFile(
+      memPath,
+      [
+        "## 2. 常用工作区地图",
+        `- **统一日常总控与个人知识库**：\`${homeDir}\``,
+        `- **美亚撸货自动化**：\`${mpDir}\``,
+        `- **普通脚本仓库**：\`${plainDir}\``,
+        "## 3. 当前长期关注事项",
+        `- **[2026-11-27] QQQ兄弟会自主意识微信群机器人 AI 公司（\`qqq-bro-bot\`）**：已在 \`${qqqDir}\` 创办。`,
+      ].join("\n"),
+      "utf8",
+    );
+
+    const store = new BotStateStore(tmpRoot);
+    const engine = new ProactiveEngine({ store });
+
+    const hooks = new Map<string, (ev: any, ctx: any) => Promise<void>>();
+    const fakeServer = {
+      addHook(name: string, fn: (ev: any, ctx: any) => Promise<void>) {
+        hooks.set(name, fn);
+        return () => hooks.delete(name);
+      },
+    } as unknown as PluginServerContext;
+
+    const settingsValues = {
+      ...DEFAULT_BOT_SETTINGS,
+      homeCwd: homeDir,
+      memoryFilePath: memPath,
+      desktopNotify: false,
+      webhookEnabled: false,
+    };
+    const fakeSettingsHandle = {
+      read: async () => ({ status: "ready" as const, values: settingsValues }),
+      subscribe: () => () => undefined,
+    };
+
+    interface MockAgent {
+      id: string;
+      title: string;
+      cwd: string;
+      workspaceId: string;
+      provider: string;
+      model: string;
+      status: string;
+      archivedAt: string | null;
+      background?: boolean;
+      labels?: Record<string, string>;
+      sentPayloads: string[];
+      latestAssistantReply: string;
+    }
+
+    const agents = new Map<string, MockAgent>([
+      [
+        mpLeadId,
+        {
+          id: mpLeadId,
+          title: "总控调度",
+          cwd: mpDir,
+          workspaceId: "wks_mp",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          status: "closed",
+          archivedAt: null,
+          labels: { company: "moneyprinter", role: "lead" },
+          sentPayloads: [],
+          latestAssistantReply: "",
+        },
+      ],
+      [
+        qqqLeadId,
+        {
+          id: qqqLeadId,
+          title: "产品总控",
+          cwd: qqqDir,
+          workspaceId: "wks_qqq",
+          provider: "antigravity",
+          model: "gemini-4-neon",
+          status: "idle",
+          archivedAt: null,
+          labels: { company: "QQQ兄弟会", role: "lead" },
+          sentPayloads: [],
+          latestAssistantReply: "",
+        },
+      ],
+    ]);
+
+    let spawnedWorkers = 0;
+    const makeHandle = (rec: MockAgent) => ({
+      id: rec.id,
+      workspaceId: rec.workspaceId,
+      cwd: rec.cwd,
+      current: () => ({
+        id: rec.id,
+        title: rec.title,
+        cwd: rec.cwd,
+        labels: rec.labels,
+      }),
+      refresh: async () => ({
+        agent: {
+          id: rec.id,
+          title: rec.title,
+          cwd: rec.cwd,
+          workspaceId: rec.workspaceId,
+          provider: rec.provider,
+          model: rec.model,
+          status: rec.status,
+          archivedAt: rec.archivedAt,
+          background: Boolean(rec.background),
+          labels: rec.labels,
+        },
+        project: null,
+      }),
+      send: async (text: string) => {
+        rec.sentPayloads.push(text);
+        rec.status = "running";
+      },
+      run: async () => ({ status: "idle" as const, lastMessage: "ok" }),
+      waitForFinish: async () => ({ status: "idle" as const, lastMessage: "ok" }),
+      archive: async () => {
+        rec.archivedAt = new Date().toISOString();
+      },
+      timeline: {
+        refetch: async () => ({
+          entries: rec.latestAssistantReply
+            ? [
+                {
+                  turnId: "t_latest",
+                  item: { type: "assistant_message", text: rec.latestAssistantReply },
+                },
+              ]
+            : [],
+        }),
+        append: async () => ({ seq: 1, epoch: "e1" }),
+      },
+    });
+
+    const mockPaseo = {
+      providers: {
+        snapshot: async () => ({
+          entries: [
+            {
+              provider: "antigravity",
+              label: "Antigravity",
+              enabled: true,
+              status: "ready",
+              models: [
+                { id: "gemini-3.8-flash", label: "Flash" },
+                { id: "gemini-4-carbon", label: "Carbon", isDefault: true },
+                { id: "gemini-4-neon", label: "Neon" },
+              ],
+              modes: [{ id: "auto" }],
+            },
+          ],
+        }),
+        listModes: async () => ({ modes: [{ id: "auto" }] }),
+      },
+      workspaces: {
+        list: async () => ({
+          entries: [
+            { id: "wks_mp", workspaceDirectory: mpDir, projectDisplayName: "MoneyPrinter" },
+            { id: "wks_qqq", workspaceDirectory: qqqDir, projectDisplayName: "qqq-bro-bot" },
+            { id: "wks_plain", workspaceDirectory: plainDir, projectDisplayName: "plain-project" },
+          ],
+        }),
+        open: async (cwd: string) => ({
+          id: `wks_open_${path.basename(cwd)}`,
+          agents: {
+            create: async (opts: { title: string; config: { provider: string }; labels?: Record<string, string> }) => {
+              spawnedWorkers += 1;
+              const id = `spawned_${spawnedWorkers}`;
+              const [prov, mod] = opts.config.provider.split("/");
+              const rec: MockAgent = {
+                id,
+                title: opts.title,
+                cwd,
+                workspaceId: `wks_open_${path.basename(cwd)}`,
+                provider: prov,
+                model: mod || "gemini-4-carbon",
+                status: "running",
+                archivedAt: null,
+                labels: opts.labels,
+                sentPayloads: [],
+                latestAssistantReply: "",
+              };
+              agents.set(id, rec);
+              return makeHandle(rec);
+            },
+          },
+        }),
+        create: async (opts: { title: string; source: { cwd: string } }) => ({
+          id: `wks_wt_${spawnedWorkers + 1}`,
+          agents: {
+            create: async (createOpts: { title: string; config: { provider: string }; labels?: Record<string, string> }) => {
+              spawnedWorkers += 1;
+              const id = `spawned_wt_${spawnedWorkers}`;
+              const [prov, mod] = createOpts.config.provider.split("/");
+              const rec: MockAgent = {
+                id,
+                title: createOpts.title,
+                cwd: opts.source.cwd,
+                workspaceId: `wks_wt_${spawnedWorkers}`,
+                provider: prov,
+                model: mod || "gemini-4-carbon",
+                status: "running",
+                archivedAt: null,
+                labels: createOpts.labels,
+                sentPayloads: [],
+                latestAssistantReply: "",
+              };
+              agents.set(id, rec);
+              return makeHandle(rec);
+            },
+          },
+        }),
+      },
+      agents: {
+        list: async () => ({
+          entries: [...agents.values()].map((a) => ({
+            agent: {
+              id: a.id,
+              title: a.title,
+              cwd: a.cwd,
+              workspaceId: a.workspaceId,
+              provider: a.provider,
+              model: a.model,
+              status: a.status,
+              archivedAt: a.archivedAt,
+              background: Boolean(a.background),
+              labels: a.labels,
+              updatedAt: new Date().toISOString(),
+            },
+          })),
+        }),
+        ref: (id: string) => {
+          const rec = agents.get(id);
+          if (!rec) {
+            return {
+              id,
+              refresh: async () => null,
+              archive: async () => undefined,
+              timeline: { append: async () => ({ seq: 1, epoch: "e1" }) },
+            };
+          }
+          return makeHandle(rec);
+        },
+      },
+    } as unknown as PaseoApi;
+
+    await engine.start(fakeServer, fakeSettingsHandle as never);
+    engine.attachPaseo(mockPaseo);
+
+    // Case A: Single-stream chat mentioning MoneyPrinter routes straight to resident `总控调度` (0 spawned workers!)
+    const chatRes = await engine.sendChatMessage({
+      text: "派给美亚撸货公司：给 BG 对账加一个 $5 差额告警",
+    });
+    assert.equal(chatRes.tier, "L0");
+    assert.equal(chatRes.agentId, mpLeadId);
+    assert.equal(chatRes.routedSessionTitle, "总控调度");
+    assert.equal(chatRes.modelUsed, "antigravity/gemini-4-neon");
+    assert.equal(spawnedWorkers, 0);
+    assert.equal(agents.get(mpLeadId)!.sentPayloads.length, 1);
+    assert.match(agents.get(mpLeadId)!.sentPayloads[0], /给 BG 对账加一个 \$5 差额告警/);
+
+    const botReply = store.get().messages.find((m) => m.id === chatRes.assistantMessageId)!;
+    assert.match(botReply.text, /总控调度/);
+    assert.ok(botReply.links.some((l) => l.url === `paseo://agent/${mpLeadId}`));
+    assert.equal(
+      store.get().workers.find((w) => w.agentId === mpLeadId)?.pendingCoordinatorReport,
+      true,
+    );
+
+    // Case B: Multi-hop pipeline lifecycle in `agent.turn.after`
+    const turnAfterHook = hooks.get("agent.turn.after")!;
+    const msgCountBeforePipeline = store.get().messages.length;
+
+    // Turn 1: Coordinator dispatches to department -> stays silent, keeps pendingCoordinatorReport = true!
+    agents.get(mpLeadId)!.latestAssistantReply =
+      "已立项 T-012 并派单给情报与渠道研发部执行，待风控与账务质控部验收后汇报。";
+    await turnAfterHook(
+      {
+        agent: { id: mpLeadId, cwd: mpDir, title: "总控调度", background: false, labels: { company: "moneyprinter", role: "lead" } },
+        turnId: "t_latest",
+        outcome: { kind: "completed" },
+      },
+      { paseo: mockPaseo },
+    );
+    assert.equal(store.get().messages.length, msgCountBeforePipeline, "Turn-1 dispatch ack must stay silent");
+    assert.equal(
+      store.get().workers.find((w) => w.agentId === mpLeadId)?.pendingCoordinatorReport,
+      true,
+      "pendingCoordinatorReport must remain true until final conclusion",
+    );
+
+    // Turn 2: Coordinator delivers final conclusion -> syncs bubble & clears pendingCoordinatorReport!
+    agents.get(mpLeadId)!.latestAssistantReply =
+      "BG 对账 **$5** 差额告警（T-012）已全部完成验收并同步生效，后续差额超阈值会直接推送到手机。";
+    await turnAfterHook(
+      {
+        agent: { id: mpLeadId, cwd: mpDir, title: "总控调度", background: false, labels: { company: "moneyprinter", role: "lead" } },
+        turnId: "t_latest",
+        outcome: { kind: "completed" },
+      },
+      { paseo: mockPaseo },
+    );
+    assert.equal(store.get().messages.length, msgCountBeforePipeline + 1);
+    const syncedBubble = store.get().messages[store.get().messages.length - 1]!;
+    assert.match(syncedBubble.text, /\$5.*差额告警/);
+    assert.ok(syncedBubble.links.some((l) => l.url === `paseo://agent/${mpLeadId}`));
+    assert.equal(
+      store.get().workers.find((w) => w.agentId === mpLeadId)?.pendingCoordinatorReport,
+      false,
+    );
+
+    // Turn 3: Later manual chat in IDE tab without release signal -> stays silent per ADR-004!
+    agents.get(mpLeadId)!.latestAssistantReply = "好的，我先看一下日志目录结构。";
+    await turnAfterHook(
+      {
+        agent: { id: mpLeadId, cwd: mpDir, title: "总控调度", background: false, labels: { company: "moneyprinter", role: "lead" } },
+        turnId: "t_latest",
+        outcome: { kind: "completed" },
+      },
+      { paseo: mockPaseo },
+    );
+    assert.equal(store.get().messages.length, msgCountBeforePipeline + 1);
+
+    // Case C: `delegateTask` routes to `qqq-bro-bot` coordinator via live `labels.role="lead"` (no roster.md needed!)
+    const delegatedQqq = await engine.delegateTask({
+      title: "新增夜间免打扰开关",
+      cwd: qqqDir,
+      prompt: "请在配置中支持 01:00-07:00 主动冒泡静音。",
+    });
+    assert.equal(delegatedQqq.agentId, qqqLeadId);
+    assert.equal(delegatedQqq.pendingCoordinatorReport, true);
+    assert.equal(spawnedWorkers, 0);
+    assert.equal(agents.get(qqqLeadId)!.sentPayloads.length, 1);
+
+    // Case D: Self-loop guard — when `qqqLeadId` itself (or a member of `QQQ兄弟会`) calls `delegateTask`, spawn standalone worker!
+    const helperFromLead = await engine.delegateTask({
+      title: "并行跑集成测试",
+      cwd: qqqDir,
+      prompt: "Run pytest",
+      callerAgentId: qqqLeadId,
+      callerLabels: { company: "QQQ兄弟会", role: "lead" },
+    });
+    assert.notEqual(helperFromLead.agentId, qqqLeadId);
+    assert.equal(spawnedWorkers, 1);
+
+    // Case E: `isolation: "worktree"` and plain non-company directories smoothly spawn standalone workers (backward-compatible!)
+    const worktreeWorker = await engine.delegateTask({
+      title: "隔离分支实验",
+      cwd: mpDir,
+      prompt: "Experiment in worktree",
+      isolation: "worktree",
+    });
+    assert.notEqual(worktreeWorker.agentId, mpLeadId);
+    assert.equal(worktreeWorker.isolation, "worktree");
+    assert.equal(spawnedWorkers, 2);
+
+    const plainWorker = await engine.delegateTask({
+      title: "构建静态博客",
+      cwd: plainDir,
+      prompt: "node scripts/build.mjs",
+    });
+    assert.equal(plainWorker.cwd, plainDir);
+    assert.equal(plainWorker.pendingCoordinatorReport, undefined);
+    assert.equal(spawnedWorkers, 3);
+
+    await engine.stop();
+  } finally {
+    await fs.rm(tmpRoot, { recursive: true, force: true });
   }
 });
